@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pandas
+chromadb
+llama-parse
+llama-index
+sqlmodel
+pytest
+requests
+python-dotenv
+openai
