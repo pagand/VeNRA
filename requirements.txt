@@ -6,6 +6,10 @@ llama-parse
 llama-index
 sqlmodel
 pytest
+pytest-asyncio
+nest-asyncio
 requests
 python-dotenv
 openai
+instructor
+pydantic-settings

@@ -6,7 +6,7 @@
 .idea/
 *.swp
 .DS_Store
-.geminignore
+.geminiignore
 
 # Compiled Python files
 *__pycache__*
@@ -21,11 +21,10 @@ chroma_db*
 *.sqlite
 *.sqlite3
 *.db
+data/processed/
+
 
 .pytest_cache*
-alembic*
-results*
-plots*
 
 # # LLM plannar
 DEVELOPMENT_PLAN.md
