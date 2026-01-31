@@ -71,6 +71,7 @@ class ScrapedFact(BaseModel):
     value: Optional[Union[float, str]] = Field(None, description="The numerical value. Can be string if parsing fails or ID.")
     unit: str = Field(default="USD", description="Unit of the value, e.g. 'USD', 'Employees', 'Percent'")
     period: Optional[str] = Field(None, description="The time period mentioned, e.g. '2023', 'December 31, 2023'. If implicit, leave None.")
+    related_entity: Optional[str] = Field(None, description="Target of relationship, e.g. 'Boeing' or 'CEO-owned VIE'")
     nuance_note: Optional[str] = Field(None, description="Context, conditions, exclusions, or the full qualitative statement.")
     confidence: float = Field(..., description="0.0 to 1.0 confidence in this extraction.")
 

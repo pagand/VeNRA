@@ -1,5 +1,9 @@
 import os
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Get the project root directory (assuming config.py is in src/venra)
+PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 
 class Settings(BaseSettings):
     # --- API Keys ---
@@ -18,7 +22,7 @@ class Settings(BaseSettings):
     CONFIDENCE_TEXT_LOW: float = 0.60
 
     # --- Prompt Paths ---
-    PROMPTS_PATH: str = "assets/PROMPTS.md"
+    PROMPTS_PATH: str = str(PROJECT_ROOT / "assets" / "PROMPTS.md")
 
     # --- Storage ---
     CHROMA_DB_PATH: str = "data/chroma_db"

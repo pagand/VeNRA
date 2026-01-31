@@ -154,6 +154,33 @@ def test_melter_placeholder_rows():
     assert row.confidence == 0.0 # Should be 0.0 for placeholders
     assert row.entity_name_raw == "Test Corp" # Check raw name population
 
+def test_table_melter_deterministic_cleaning():
+    """
+    Test that footnotes are stripped and dashes are treated as zero.
+    """
+    markdown = """
+| Metric (1) | 2023 | 2022 |
+|---|---|---|
+| Sales (a) | 125(2) | — |
+| Profit | 10.5b | (5.0) |
+"""
+    block = TableBlock(content=markdown, section_path=["Financials"])
+    melter = TableMelter(entity_id="ID_TEST")
+    rows = melter.melt(block)
+    
+    # Check Sales 2023 (Footnote stripped from both metric and value)
+    sales_23 = next(r for r in rows if r.metric_name == "Sales" and r.period == "2023")
+    assert sales_23.value == 125.0
+    
+    # Check Sales 2022 (Dash to zero)
+    sales_22 = next(r for r in rows if r.metric_name == "Sales" and r.period == "2022")
+    assert sales_22.value == 0.0
+    assert sales_22.nuance_note == "Dash treated as zero"
+    
+    # Check Profit 2023 (Trailing letter footnote stripped)
+    profit_23 = next(r for r in rows if r.metric_name == "Profit" and r.period == "2023")
+    assert profit_23.value == 10.5
+
 # ==========================================
 # Feature: Text-to-Fact Extraction
 # ==========================================
