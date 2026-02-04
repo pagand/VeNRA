@@ -319,6 +319,75 @@ async def test_text_synthesizer_string_id_handling():
         assert "41-2101738" in rows[0].nuance_note
 
 # ==========================================
+# Feature: Multi-Fact Extraction (Single Block)
+# ==========================================
+
+@pytest.mark.asyncio
+async def test_text_synthesizer_multiple_facts_single_block():
+    """
+    Test extraction of multiple distinct facts from a single text block.
+    A single sentence can contain multiple metrics - we must extract all of them.
+    """
+    block = TextBlock(
+        content="In fiscal 2023, revenue increased 12% to $500 million, while operating income grew 8% to $75 million and our workforce expanded to 2,500 employees.",
+        section_path=["MD&A", "Operating Results"]
+    )
+
+    # Mock Response with multiple facts extracted from one sentence
+    mock_resp = FactExtractionResponse(facts=[
+        ScrapedFact(
+            metric_name="Revenue",
+            value=500_000_000.0,
+            unit="USD",
+            period="2023",
+            nuance_note="12% increase",
+            confidence=0.95
+        ),
+        ScrapedFact(
+            metric_name="Operating Income",
+            value=75_000_000.0,
+            unit="USD",
+            period="2023",
+            nuance_note="8% growth",
+            confidence=0.92
+        ),
+        ScrapedFact(
+            metric_name="Employee Count",
+            value=2500.0,
+            unit="count",
+            period="2023",
+            confidence=0.98
+        )
+    ])
+
+    with patch("venra.synthesis.instructor.from_openai") as mock_init:
+        mock_client = MagicMock()
+        mock_init.return_value = mock_client
+        mock_client.chat.completions.create.return_value = mock_resp
+
+        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        rows = await synthesizer.extract_facts(block)
+
+        # Should extract all 3 facts
+        assert len(rows) == 3
+
+        # Verify revenue row
+        revenue_row = next(r for r in rows if r.metric_name == "Revenue")
+        assert revenue_row.value == 500_000_000.0
+        assert revenue_row.period == "2023"
+        assert "12%" in revenue_row.nuance_note
+
+        # Verify operating income row
+        oi_row = next(r for r in rows if r.metric_name == "Operating Income")
+        assert oi_row.value == 75_000_000.0
+        assert "8%" in oi_row.nuance_note
+
+        # Verify all rows link back to the same source chunk
+        for row in rows:
+            assert row.source_chunk_id == block.id
+            assert row.entity_id == "ID_TEST"
+
+# ==========================================
 # Feature: Context Indexing (ChromaDB)
 # ==========================================
 

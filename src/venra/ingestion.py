@@ -89,10 +89,17 @@ class StructuralParser:
         has_pipe = any("|" in l for l in lines)
         has_separator = any("|" in l and "---" in l for l in lines)
         
+        block = None
         if has_pipe and has_separator:
-            all_blocks.append(self._create_table_block(lines, stack))
+            block = self._create_table_block(lines, stack)
         else:
-            all_blocks.append(self._create_text_block(lines, stack))
+            block = self._create_text_block(lines, stack)
+            
+        # Generate unique ID based on content and path
+        import hashlib
+        id_seed = f"{block.section_path}_{block.content}"
+        block.id = hashlib.md5(id_seed.encode()).hexdigest()
+        all_blocks.append(block)
 
     def _create_text_block(self, lines: List[str], stack: List[str]) -> TextBlock:
         return TextBlock(

@@ -21,10 +21,12 @@ chroma_db*
 *.sqlite
 *.sqlite3
 *.db
-data/processed/
+data/processed/*
 
 
 .pytest_cache*
+multi_provider_proxy.py
+multi_provider_proxy_agent.py
 
 # # LLM plannar
 DEVELOPMENT_PLAN.md
@@ -33,3 +35,4 @@ TESTING_STRATEGY.md
 IMPROVEMENT.md
 GEMINI.md
 UFL_SPEC.md
+NAVIGATOR_SPEC.md

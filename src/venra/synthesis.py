@@ -11,6 +11,7 @@ from openai import OpenAI
 from pydantic import BaseModel
 from venra.models import DocBlock, TableBlock, TextBlock, UFLRow, EntityMetadata, FactExtractionResponse, ScrapedFact
 from venra.config import settings
+from venra.prompt_loader import load_prompt
 from venra.logging_config import logger
 
 class EntityResolver:
@@ -76,13 +77,37 @@ class TableMelter:
         content = block.content.strip()
         lines = content.split("\n")
         
+        if not lines:
+            return []
+
+        # 0. Header Merging Heuristic
+        # Tables often have multi-line headers like "| Fiscal Years | | |" followed by "| Ended | 2025 | 2024 |"
+        header_rows = []
+        data_start_idx = 0
+        for i, line in enumerate(lines[:5]):
+            if re.match(r"^\|?\s*:?-+:?\s*\|", line.strip()):
+                data_start_idx = i + 1
+                break
+            header_rows.append([p.strip() for p in line.strip().strip("|").split("|")])
+        
+        # Merge headers
+        merged_headers = []
+        if header_rows:
+            num_cols = max(len(r) for r in header_rows)
+            for col_idx in range(num_cols):
+                parts = []
+                for row in header_rows:
+                    if col_idx < len(row) and row[col_idx]:
+                        parts.append(row[col_idx])
+                merged_headers.append(" ".join(parts).strip())
+        
         # 1. Hierarchical Disambiguation (Track parents by indentation)
         hierarchy_lines = []
         parent_stack = [] # List of names
         
-        for line in lines:
+        # Skip the original header rows we just merged
+        for line in lines[data_start_idx:]:
             if not line.strip() or re.match(r"^\|?\s*:?-+:?\s*\|", line.strip()):
-                hierarchy_lines.append(line)
                 continue
                 
             # Detect indentation: count leading &nbsp; or spaces after the first optional |
@@ -92,7 +117,6 @@ class TableMelter:
                 metric_text = indent_match.group(2).strip()
                 
                 if not metric_text or metric_text.lower() in ["item", "value", "metric"]:
-                    hierarchy_lines.append(line)
                     continue
 
                 # Depth calculation: 1 &nbsp; or 2 spaces = 1 depth unit
@@ -108,8 +132,6 @@ class TableMelter:
                 else:
                     full_name = metric_text
                 
-                # Robust replacement: Split by pipe, replace the first content segment
-                # Strip leading and trailing pipes for splitting
                 inner_content = line.strip().strip("|")
                 parts = [p.strip() for p in inner_content.split("|")]
                 
@@ -119,17 +141,21 @@ class TableMelter:
                     parent_stack.append(metric_text)
                 
                 parts[0] = full_name
+                # Ensure parts length matches merged_headers
+                if len(parts) < len(merged_headers):
+                    parts.extend([""] * (len(merged_headers) - len(parts)))
+                
                 new_line = "| " + " | ".join(parts) + " |"
                 hierarchy_lines.append(new_line)
-            else:
-                hierarchy_lines.append(line)
 
         # 2. Cleanup and DataFrame Conversion
-        clean_lines = [l for l in hierarchy_lines if not re.match(r"^\|?\s*:?-+:?\s*\|", l.strip())]
-        csv_content = "\n".join([l.strip("|") for l in clean_lines])
+        csv_header = "| " + " | ".join(merged_headers) + " |"
+        csv_content = csv_header + "\n" + "\n".join(hierarchy_lines)
         
         try:
             df = pd.read_csv(io.StringIO(csv_content), sep=r"\s*\|\s*", engine="python")
+            # Filter out the "empty" columns from leading/trailing pipes
+            df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
             df.columns = [c.strip() for c in df.columns]
         except Exception as e:
             logger.error(f"Pandas parsing failed: {e}")
@@ -261,18 +287,7 @@ class TextSynthesizer:
             mode=instructor.Mode.JSON
         )
         self.model = settings.SLM_MODEL_FAST
-        
-        try:
-            with open(settings.PROMPTS_PATH, "r") as f:
-                content = f.read()
-                match = re.search(r"## Text Extraction \(System Prompt\)(.*?)(##|$)", content, re.DOTALL)
-                if match:
-                    self.prompt_template = match.group(1).strip()
-                else:
-                    self.prompt_template = content
-        except FileNotFoundError:
-            logger.error(f"Prompt file not found at {settings.PROMPTS_PATH}. Using default.")
-            self.prompt_template = "You are a financial analyst. Extract facts from: {{text_content}}"
+        self.prompt_template = load_prompt("extract_financial_facts") or "You are a financial analyst. Extract facts from: {{text_content}}"
 
     async def extract_facts(self, block: TextBlock, context_str: str = "", model_name: Optional[str] = None) -> List[UFLRow]:
         if len(block.content.strip()) < 10:
@@ -356,7 +371,7 @@ class ContextIndexer:
         documents = [b.content for b in blocks]
         ids = [b.id for b in blocks]
         metadatas = [{"block_type": b.block_type.value, "section_path": json.dumps(b.section_path), "page_num": b.page_num or 0} for b in blocks]
-        self.text_collection.add(documents=documents, ids=ids, metadatas=metadatas)
+        self.text_collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
         logger.info(f"Indexed {len(blocks)} blocks in ChromaDB.")
 
     def index_ufl_schema(self, rows: List[UFLRow]):

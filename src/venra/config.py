@@ -1,14 +1,15 @@
 import os
 from pathlib import Path
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Get the project root directory (assuming config.py is in src/venra)
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 
 class Settings(BaseSettings):
-    # --- API Keys ---
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    # API Keys
+    GROQ_API_KEY: Optional[str] = None
+    NVIDIA_API_KEY: Optional[str] = None
     LLAMA_CLOUD_API_KEY: str = os.getenv("LLAMA_CLOUD_API_KEY", "")
 
     # --- Models ---
@@ -25,7 +26,8 @@ class Settings(BaseSettings):
     PROMPTS_PATH: str = str(PROJECT_ROOT / "assets" / "PROMPTS.md")
 
     # --- Storage ---
-    CHROMA_DB_PATH: str = "data/chroma_db"
+    DATA_DIR: str = str(PROJECT_ROOT / "data")
+    CHROMA_DB_PATH: str = str(PROJECT_ROOT / "data" / "chroma_db")
 
     model_config = SettingsConfigDict(
         env_file=".env",

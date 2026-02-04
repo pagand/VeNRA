@@ -1,80 +1,79 @@
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Any, Union
+from typing import List, Optional, Union, Dict, Any, Literal
 from pydantic import BaseModel, Field
+from enum import Enum
 
 class BlockType(str, Enum):
     TEXT = "text"
     TABLE = "table"
-    HEADER = "header"
 
 class DocBlock(BaseModel):
-    """Base class for a chunk of document content."""
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: str = Field(default_factory=lambda: "") # Will be set by hashing content
     block_type: BlockType
-    section_path: List[str] = Field(default_factory=list, description="Hierarchy stack e.g. ['MD&A', 'Liquidity']")
-    page_num: Optional[int] = Field(default=None)
-    content: str = Field(..., description="The raw text or markdown table")
+    content: str
+    section_path: List[str]
+    page_num: Optional[int] = None
 
 class TextBlock(DocBlock):
     block_type: BlockType = BlockType.TEXT
 
 class TableBlock(DocBlock):
     block_type: BlockType = BlockType.TABLE
-    
-class HeaderBlock(DocBlock):
-    block_type: BlockType = BlockType.HEADER
-    level: int
-
-class EntityMetadata(BaseModel):
-    """
-    Taxonomy info extracted from the cover page.
-    Ensures we have a canonical ID for the entity.
-    """
-    canonical_id: str = Field(..., description="Unique ID, e.g. 'ID_TDG' or 'ID_AAPL'")
-    official_name: str = Field(..., description="Exact name from charter, e.g. 'TransDigm Group Incorporated'")
-    cik: Optional[str] = Field(None, description="Central Index Key")
-    aliases: List[str] = Field(default_factory=list, description="List of other names used in doc, e.g. ['The Company', 'TransDigm']")
 
 class UFLRow(BaseModel):
-    row_id: str = Field(..., description="Unique Hash: md5(entity + metric + period)")
-    
-    # --- Search & Graph Keys ---
-    entity_id: str = Field(..., description="Canonical ID from Alias Map (e.g., 'ID_AAPL')")
-    entity_name_raw: str = Field(..., description="The raw name as it appeared in source (e.g., 'The Company')")
-    metric_name: str = Field(..., description="The raw row header (e.g., 'Net sales')")
-    metric_embedding_id: Optional[str] = Field(None, description="ID for vector lookup of this metric name")
-    related_entity_id: Optional[str] = Field(None, description="Target of edge. If metric is 'Supplier', this is 'FOXCONN'.")
-    
-    # --- Computation Values ---
-    value: Optional[float] = Field(None, description="Normalized float. None/NaN if qualitative.")
-    unit: str = Field(default="USD", description="Currency or Unit")
-    scale_factor: float = Field(default=1.0, description="Multiplier found in header (e.g., 1e6)")
-    
-    # --- Context & Filtering ---
-    period: str = Field(..., description="Time period (e.g., '2023-FY', '2023-Q3')")
-    doc_section: str = Field(..., description="Breadcrumb path (e.g., 'MD&A > Liquidity > Table 4')")
-    
-    # --- Audit & Linkage ---
-    source_chunk_id: str = Field(..., description="Foreign Key to ChromaDB Text Chunk")
-    source_bbox: Optional[dict] = Field(None, description="Bounding box {page, x, y, w, h} for UI highlight.")
-    nuance_note: Optional[str] = Field(None, description="Footnotes or conditions (e.g., 'Unaudited')")
-    confidence: float = Field(..., description="0.95 for Table Melts, 0.7 for Text Extraction")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    row_id: str
+    entity_id: str
+    entity_name_raw: str
+    metric_name: str
+    value: Optional[float]
+    unit: Optional[str] = None
+    scale_factor: float = 1.0
+    period: str
+    doc_section: str
+    source_chunk_id: str
+    nuance_note: Optional[str] = None
+    confidence: float
+    related_entity_id: Optional[str] = None
 
-# --- Instructor Models ---
+class EntityMetadata(BaseModel):
+    canonical_id: str
+    official_name: str
+    cik: Optional[str] = None
+    aliases: List[str] = []
 
 class ScrapedFact(BaseModel):
-    """A single fact extracted from text."""
-    metric_name: str = Field(..., description="The name of the metric or fact, e.g. 'Backlog', 'Litigation Risk'")
-    value: Optional[Union[float, str]] = Field(None, description="The numerical value. Can be string if parsing fails or ID.")
-    unit: str = Field(default="USD", description="Unit of the value, e.g. 'USD', 'Employees', 'Percent'")
-    period: Optional[str] = Field(None, description="The time period mentioned, e.g. '2023', 'December 31, 2023'. If implicit, leave None.")
-    related_entity: Optional[str] = Field(None, description="Target of relationship, e.g. 'Boeing' or 'CEO-owned VIE'")
-    nuance_note: Optional[str] = Field(None, description="Context, conditions, exclusions, or the full qualitative statement.")
-    confidence: float = Field(..., description="0.0 to 1.0 confidence in this extraction.")
+    metric_name: str
+    value: Optional[Union[float, str]]
+    unit: Optional[str] = "USD"
+    period: Optional[str] = None
+    nuance_note: Optional[str] = None
+    related_entity: Optional[str] = None
+    confidence: float
 
 class FactExtractionResponse(BaseModel):
-    """Container for multiple facts extracted from a single text block."""
     facts: List[ScrapedFact]
+
+# --- Navigator Models ---
+
+class UFLFilter(BaseModel):
+    """Configuration for the structured data lookup."""
+    entity_ids: List[str] = Field(..., description="Canonical IDs (e.g., 'ID_AAPL')")
+    metric_keywords: List[str] = Field(..., description="List of potential column headers to search for (e.g., ['Net Sales', 'Revenue'])")
+    years: List[str] = Field(..., description="Specific years mentioned (e.g., ['2023', '2022']). Leave empty if asking for 'current' or 'trend'.")
+    nuance_focus: Optional[str] = Field(None, description="Keywords for nuance filtering (e.g., 'Restated', 'Adjusted')")
+
+class RetrievalPlan(BaseModel):
+
+    """The Master Plan (Clues) generated by the Navigator SLM."""
+
+    
+
+    ufl_query: Optional[UFLFilter] = Field(None, description="Clues for the structured database lookup.")
+
+    vector_hypothesis: str = Field(..., description="A hypothetical sentence or table header that would appear in the document containing the answer.")
+
+    vector_keywords: List[str] = Field(..., description="3-5 key search terms for BM25/Keyword search.")
+
+    reasoning: str = Field(..., description="Brief explanation of the translation logic.")
