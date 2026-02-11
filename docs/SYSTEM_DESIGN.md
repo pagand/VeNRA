@@ -76,7 +76,7 @@ We move from "Retrieving Text" to "Retrieving Variables." We replace probabilist
 
 *Goal: Low-latency, specialized verification.*
 
-* **Model:** Small Language Model (e.g., Qwen-4B, Phi-3), potentially fine-tuned.
+* **Model:** Small Language Model (e.g., Qwen-4B, Phi-3) as a proxy to fine-tuned hallucination.
 * **Input:**
     1.  **User Query:** "What is the 2023 Revenue?"
     2.  **UFL Context:** The rows used for calculation.
@@ -88,7 +88,7 @@ We move from "Retrieving Text" to "Retrieving Variables." We replace probabilist
     *   *Why SLM?* Faster and cheaper than calling GPT-4 for every verification step. Can be trained on specific "financial consistency" tasks.
 * **Output:**
     *   Score > Threshold (e.g., 0.9): Pass.
-    *   Score < Threshold: Trigger "I am not sure" or fallback to manual review.
+    *   Score < Threshold: tag verified or not sure , or not grounded.
 
 ---
 
@@ -106,12 +106,9 @@ We move from "Retrieving Text" to "Retrieving Variables." We replace probabilist
     *   *Mitigation:* Use a specialized embedding model for finance (e.g., `bge-m3` or `uae-large-v1`) for the schema search.
 2.  **Context Misalignment:** If LlamaParse misinterprets a table header, the `period` column will be wrong.
     *   *Mitigation:* The "Hierarchy Stack" logic in ingestion is the primary defense.
-3.  **SLM Overconfidence:** The small model might just agree with the generated answer.
-    *   *Mitigation:* Use "Chain of Verification" prompts or fine-tune on a dataset of *known* hallucinations.
 
 
 ### **Research Questions (RQs)**
-
 
 
 1. **RQ1 (Data Structure):** Does a "Fact Ledger" (semi-structured intermediate layer) outperform pure Unstructured RAG on multi-hop financial queries?

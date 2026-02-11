@@ -56,7 +56,7 @@ VeNRA moves beyond simple "Text Retrieval" to a **Hybrid Neuro-Symbolic Architec
 
 4.  **Run the Service:**
     ```bash
-    uvicorn src.venra.main:app --reload
+    uvicorn venra.main:app --reload --app-dir src
     ```
     The Sentinel Service is now active at `http://localhost:8000`.
 

@@ -96,25 +96,45 @@ class ReasoningAgent:
                 logger.info(f"Code output: {code_result['output']}")
 
         # Pass 2: Groq for fast Synthesis
-        logger.info("Pass 2: Synthesis (Fast)")
-        
-        user_prompt_2 = f"""
+        if settings.ENABLE_AGENT_SYNTHESIS:
+            logger.info("Pass 2: Synthesis (Fast)")
+            
+            user_prompt_2 = f"""
 QUERY: {query}
 CONTEXT: {context}
 REASONING: {reasoning.plan}
 CODE_OUTPUT: {code_result['output'] if code_result else 'No code run'}
 CODE_ERROR: {code_result['error'] if code_result else 'None'}
 """
-        
-        final = self.fast_client.chat.completions.create(
-            model=settings.SLM_MODEL_PRECISION, # llama-3.3-70b
-            response_model=FinalResponse,
-            messages=[
-                {"role": "system", "content": self.pass_2_prompt},
-                {"role": "user", "content": user_prompt_2}
-            ],
-            temperature=0.0
-        )
+            
+            final = self.fast_client.chat.completions.create(
+                model=settings.SLM_MODEL_PRECISION, # llama-3.3-70b
+                response_model=FinalResponse,
+                messages=[
+                    {"role": "system", "content": self.pass_2_prompt},
+                    {"role": "user", "content": user_prompt_2}
+                ],
+                temperature=0.0
+            )
+        else:
+            logger.info("Pass 2: Synthesis Skipped (Config)")
+            
+            # Determine best available answer
+            if code_result and code_result.get("output"):
+                # If code ran, the output is the most precise answer
+                raw_answer = str(code_result["output"])
+            else:
+                # Fallback to the plan if no code was executed
+                raw_answer = f"[Synthesis Skipped] Reasoning Plan: {reasoning.plan}"
+
+            final = FinalResponse(
+                answer=raw_answer,
+                nuances=None,
+                data_source_type="MIXED", # Default as we skipped verification
+                citations=[],
+                groundedness_score=-1.0, # Indicator for skipped scoring
+                is_self_aware_warning=False
+            )
         
         return {
             "final_response": final,

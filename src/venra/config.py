@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     # API Keys
     GROQ_API_KEY: Optional[str] = None
     NVIDIA_API_KEY: Optional[str] = None
+    OPENROUTER_API_KEY: Optional[str] = None
     LLAMA_CLOUD_API_KEY: str = os.getenv("LLAMA_CLOUD_API_KEY", "")
 
     # --- Models ---
@@ -28,6 +29,9 @@ class Settings(BaseSettings):
     # --- Storage ---
     DATA_DIR: str = str(PROJECT_ROOT / "data")
     CHROMA_DB_PATH: str = str(PROJECT_ROOT / "data" / "chroma_db")
+
+    # --- Agent Flags ---
+    ENABLE_AGENT_SYNTHESIS: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

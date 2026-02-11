@@ -21,7 +21,7 @@ chroma_db*
 *.sqlite
 *.sqlite3
 *.db
-data/processed/*
+data/*
 
 
 .pytest_cache*
@@ -36,3 +36,7 @@ IMPROVEMENT.md
 GEMINI.md
 UFL_SPEC.md
 NAVIGATOR_SPEC.md
+halDet_spec.md
+FinFactDataGen_spec.md
+saboteur_spec.md
+teacher_spec.md

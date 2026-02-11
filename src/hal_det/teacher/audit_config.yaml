@@ -1,0 +1,48 @@
+audit_targets:
+  # ---------------------------------------------------------
+  # 1. SABOTAGED ROWS (High Value, Needs Verification)
+  # ---------------------------------------------------------
+  sabotaged_unfounded:
+    enabled: true
+    filters:
+      has_sabotage_info: true
+      label: "Unfounded"
+    validation_mode: "strict_injection_match"
+    action_on_mismatch: "review" # We want to see these if they fail slightly (e.g. valid but low span score)
+
+  # ---------------------------------------------------------
+  # 2. SUPPORTED PARENTS (High Value, Zero Tolerance)
+  # ---------------------------------------------------------
+  supported_parents:
+    enabled: true
+    filters:
+      label: "Supported"
+      has_sabotage_info: false
+    validation_mode: "label_consistency" 
+    action_on_mismatch: "review" # If Teacher says Unfounded, kill it. Don't waste my time.
+
+  # ---------------------------------------------------------
+  # 3. NATURAL FAILS (Medium Value, Zero Tolerance)
+  # ---------------------------------------------------------
+  natural_unfounded:
+    enabled: true
+    filters:
+      label: "Unfounded"
+      has_sabotage_info: false
+    validation_mode: "trust_teacher"
+    action_on_mismatch: "discard" # If Teacher says Supported, kill it.
+
+  # ---------------------------------------------------------
+  # 4. GENERAL AXIOMS (Trust implicitly)
+  # ---------------------------------------------------------
+  general_axioms:
+    enabled: true
+    filters:
+      label: "General"
+    validation_mode: "generate_only" # Just generate reasoning, assume valid.
+    action_on_mismatch: "keep"
+
+input_file: "data/training_candidates/candidate_train.jsonl"
+cache_file: "data/training_ready/audit_cache.jsonl"
+concurrency: 10
+timeout_seconds: 300
