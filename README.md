@@ -41,11 +41,55 @@ VeNRA moves beyond simple "Text Retrieval" to a **Hybrid Neuro-Symbolic Architec
     ```
 
 2.  **Set Up Environment:**
-    ```bash
-    python3.11 -m venv .venv
-    source .venv/bin/activate
-    pip install -r requirements.txt
-    ```
+## Automatic
+The setup.sh script will:
+
+1. Try cu130 first 
+2. all back to cu128 if cu130 doesn't exist
+
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+## Manual
+2.1. Create virtual environment
+```bash
+python3.11 -m venv venv
+source venv/bin/activate
+```
+
+2.2. Upgrade pip
+```bash
+pip install --upgrade pip setuptools wheel
+```
+
+2.3. Install PyTorch (for CUDA>13.0)
+```bash
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+```
+
+# If not:
+```bash
+# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
+2.4. Verify installation
+```bash
+python3 << 'EOF'
+import torch
+print(f"PyTorch: {torch.__version__}")
+print(f"CUDA: {torch.version.cuda}")
+print(f"GPU Available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+EOF
+```
+
+2.5. Install remaining dependencies
+```bash
+pip install -r requirements.txt
+```
 
 3.  **Configure:**
     Create a `.env` file in the root directory:

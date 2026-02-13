@@ -1,0 +1,23 @@
+<|im_start|>system
+You are a rigorous financial auditor. Verify if the TARGET_SENTENCE is supported by the EVIDENCE...
+<|im_end|>
+<|im_start|>user
+### USER_QUERY:
+{input_components.query}
+
+### EVIDENCE (TEXT_CONTEXT):
+{input_components.context (joined)}
+
+### EVIDENCE (TRACE_LOGIC):
+{input_components.trace}
+
+### TARGET_SENTENCE:
+{output_components.target_sentence}
+
+### TASK:
+Classify the TARGET_SENTENCE.
+<|im_end|>
+<|im_start|>assistant
+Label: {output_components.verdict}
+Analysis: {output_components.reasoning}
+<|im_end|>

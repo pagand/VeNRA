@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CANDIDATES_PATH = PROJECT_ROOT / "data/training_candidates/candidate_train.jsonl"
 AUDIT_CACHE_PATH = PROJECT_ROOT / "data/training_ready/audit_cache.jsonl"
 DECISIONS_PATH = PROJECT_ROOT / "data/training_ready/human_audit_decisions.jsonl"
+AI_DECISIONS_PATH = PROJECT_ROOT / "data/training_ready/ai_audit_decisions.jsonl"
 
 st.set_page_config(layout="wide", page_title="VeNRA Refinement Studio", page_icon="🧪")
 
@@ -59,8 +60,19 @@ def load_data():
                 except json.JSONDecodeError:
                     continue
     
+    ai_decisions = {}
+    if AI_DECISIONS_PATH.exists():
+        with open(AI_DECISIONS_PATH, "r") as f:
+            for line in f:
+                if not line.strip(): continue
+                try:
+                    obj = json.loads(line)
+                    ai_decisions[obj["id"]] = obj
+                except json.JSONDecodeError:
+                    continue
+
     if not audits:
-        return candidates, [], {"Status": "Waiting for auditor..."}
+        return candidates, [], {"Status": "Waiting for auditor..."}, {}
     
     df_audit = pd.DataFrame(audits)
     
@@ -85,12 +97,13 @@ def load_data():
         "Total Audited": len(df_audit),
         "Auto-Verified": verified_count,
         "In Review Queue": len(review_queue),
-        "Human Decisions": len(decided_ids)
+        "Human Decisions": len(decided_ids),
+        "AI Refined": len(ai_decisions)
     }
-    return candidates, review_queue, stats
+    return candidates, review_queue, stats, ai_decisions
 
 # --- LOAD DATA ---
-candidates, audit_queue, stats = load_data()
+candidates, audit_queue, stats, ai_decisions = load_data()
 
 # --- STATE MANAGEMENT ---
 if "index" not in st.session_state:
@@ -119,6 +132,7 @@ else:
     current_audit = audit_queue[st.session_state.index]
     row_id = current_audit["id"]
     raw_data = candidates.get(row_id, {})
+    ai_data = ai_decisions.get(row_id)
     
     if not raw_data:
         st.error(f"Critical Error: ID {row_id} missing from candidates file.")
@@ -129,7 +143,13 @@ else:
 
     # --- TOP ROW: Contextual metadata ---
     reason = get_best_val(current_audit, ['validation_reason', 'rejection_reason'], "Manual review required.")
-    st.warning(f"**Audit Rejection Reason:** {reason}")
+    
+    col_warn, col_ai_banner = st.columns([2, 1])
+    with col_warn:
+        st.warning(f"**Audit Rejection Reason:** {reason}")
+    with col_ai_banner:
+        if ai_data:
+            st.error("🤖 AI-Refined (Meta-Prompt)")
     
     # Metadata and Navigation Bar
     n_col1, n_col2, n_col3 = st.columns([1, 2, 1])
@@ -187,10 +207,17 @@ else:
 
         with col_edit:
             st.subheader("🛠️ Refinement Zone (Editable)")
-            edited_sentence = st.text_area("🎯 Edit Target Sentence", value=raw_data.get('target_sentence', ''), height=100)
-            edited_trace = st.text_area("⚙️ Edit Logic Trace", value=raw_data.get('inputs', {}).get('trace_code', ''), height=150)
-            edited_thinking = st.text_area("💭 Edit Internal Thinking", value=get_best_val(current_audit, ['teacher_thinking'], ""), height=200)
-            edited_analysis = st.text_area("🔍 Edit Final Analysis", value=get_best_val(current_audit, ['teacher_analysis'], ""), height=120)
+            
+            # Use AI values if available, else fallback
+            def_sentence = ai_data.get("final_sentence") if ai_data else raw_data.get('target_sentence', '')
+            def_trace = ai_data.get("final_trace") if ai_data else raw_data.get('inputs', {}).get('trace_code', '')
+            def_thinking = ai_data.get("final_thinking") if ai_data else get_best_val(current_audit, ['teacher_thinking'], "")
+            def_analysis = ai_data.get("final_analysis") if ai_data else get_best_val(current_audit, ['teacher_analysis'], "")
+
+            edited_sentence = st.text_area("🎯 Edit Target Sentence", value=def_sentence, height=100)
+            edited_trace = st.text_area("⚙️ Edit Logic Trace", value=def_trace, height=150)
+            edited_thinking = st.text_area("💭 Edit Internal Thinking", value=def_thinking, height=200)
+            edited_analysis = st.text_area("🔍 Edit Final Analysis", value=def_analysis, height=120)
 
         st.divider()
         st.write("### Commit Decision")
@@ -218,7 +245,8 @@ else:
                     "original_teacher_label": current_audit.get("teacher_label"),
                     "sabotage_type": raw_data.get('sabotage_info', {}).get('type', 'manual'),
                     "is_manual_fix": True,
-                    "audit_target_group": target_grp
+                    "audit_target_group": target_grp,
+                    "ai_proxy_used": bool(ai_data)
                 }
             }
             with open(DECISIONS_PATH, "a") as f:
