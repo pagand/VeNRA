@@ -166,7 +166,12 @@ def format_canonical_record(
         meta.get("source_dataset") or 
         "unknown"
     ).lower()
-    sabotage_type = meta.get("sabotage_type") or "natural"
+    
+    # Extract sabotage type with priority: Audit > Sabotage Info > Metadata > Natural
+    sabotage_type = (
+        audit_data.get("sabotage_type") or 
+        "natural"
+    )
     
     # --- FAMILY ID DERIVATION (NEW) ---
     # Used to keep Parents and Children together in splits
