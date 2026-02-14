@@ -29,8 +29,7 @@ VeNRA moves beyond simple "Text Retrieval" to a **Hybrid Neuro-Symbolic Architec
 
 ### Prerequisites
 *   Python 3.11+
-*   OpenAI API Key (for reasoning)
-*   LlamaCloud API Key (for parsing)
+*   API Keys (for reasoning, parsing, monitoring).
 
 ### Installation
 
@@ -39,42 +38,52 @@ VeNRA moves beyond simple "Text Retrieval" to a **Hybrid Neuro-Symbolic Architec
     git clone https://github.com/pagand/VeNRA.git
     cd VeNRA
     ```
+2.   **Configure:**
+    Create a `.env` file in the root directory:
+```
+GEMINI_API_KEY: Meta analyzer
+LLAMA_CLOUD_API_KEY: for parsing
+GROQ_API_KEY: for auditor and reasoning generator
+OPENROUTER_API_KEY: for auditor and reasoning generator
+NVIDIA_API_KEY: for auditor and reasoning generator
+HF_TOKEN: for admin access to dataset/spaces/etc.
+WANDB_API_KEY: for logging
+```
 
-2.  **Set Up Environment:**
-## Automatic
-The setup.sh script will:
+3.  **Set Up Environment:**
+We have different dependencies for each phase (1) training and (2) serving. You do not have to install both. 
 
-1. Try cu130 first 
-2. all back to cu128 if cu130 doesn't exist
+#### Option 1: Automatic (for training only)
 
 ```bash
 chmod +x setup.sh
 ./setup.sh
 ```
 
-## Manual
-2.1. Create virtual environment
+#### Option 2: Manual (for training)
+
+3.1. Create virtual environment
 ```bash
-python3.11 -m venv venv
-source venv/bin/activate
+python3.11 -m venv .venv
+source .venv/bin/activate
 ```
 
-2.2. Upgrade pip
+3.2. Upgrade pip
 ```bash
 pip install --upgrade pip setuptools wheel
 ```
 
-2.3. Install PyTorch (for CUDA>13.0)
+3.3. Install PyTorch (for CUDA>13.0)
 ```bash
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 ```
 
-# If not:
+otherwise:
 ```bash
 # pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
-2.4. Verify installation
+3.4. Verify installation
 ```bash
 python3 << 'EOF'
 import torch
@@ -86,19 +95,29 @@ if torch.cuda.is_available():
 EOF
 ```
 
-2.5. Install remaining dependencies
+3.5. Install remaining dependencies
 ```bash
-pip install -r requirements.txt
+pip install -r requirements_training.txt
 ```
 
-3.  **Configure:**
-    Create a `.env` file in the root directory:
-    ```bash
-    OPENAI_API_KEY=sk-...
-    LLAMA_CLOUD_API_KEY=llx-...
-    ```
+#### Option 3: Manual (for serving)
+3.1. Create virtual environment
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+```
 
-4.  **Run the Service:**
+3.2. Install remaining dependencies
+```bash
+pip install -r requirements_serving.txt
+```
+
+4.  (for training): **Start training**
+```bash
+python3 src/hal_det/training/train.py
+```
+4.  (for serving):
+**Run the Service**
     ```bash
     uvicorn venra.main:app --reload --app-dir src
     ```

@@ -40,23 +40,3 @@ pandas>=2.0.0
 sentencepiece>=0.1.99  # For some tokenizers
 protobuf>=3.20.0,<5.0.0  # Avoid protobuf 4.x issues
 einops>=0.7.0  # Required by some attention implementations
-
-# others
-fastapi
-uvicorn
-chromadb
-llama-parse
-llama-index
-sqlmodel
-pytest
-pytest-asyncio
-nest-asyncio
-requests
-openai
-instructor
-pydantic-settings
-pyarrow
-tabulate==0.9.0
-rapidfuzz
-streamlit
-google-genai

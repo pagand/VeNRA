@@ -146,7 +146,7 @@ EOF
 
 # Install remaining dependencies
 echo -e "${GREEN}[8/8] Installing remaining dependencies...${NC}"
-pip install -r requirements.txt
+pip install -r requirements_training.txt
 
 # Create .env template if it doesn't exist
 if [ ! -f ".env" ]; then
