@@ -40,15 +40,10 @@ VeNRA moves beyond simple "Text Retrieval" to a **Hybrid Neuro-Symbolic Architec
     ```
 2.   **Configure:**
     Create a `.env` file in the root directory:
-```
-GEMINI_API_KEY: Meta analyzer
-LLAMA_CLOUD_API_KEY: for parsing
-GROQ_API_KEY: for auditor and reasoning generator
-OPENROUTER_API_KEY: for auditor and reasoning generator
-NVIDIA_API_KEY: for auditor and reasoning generator
-HF_TOKEN: for admin access to dataset/spaces/etc.
-WANDB_API_KEY: for logging
-```
+    ```bash
+    cp .env.example .env && nano .env # update with your credential
+    ```
+
 
 3.  **Set Up Environment:**
 We have different dependencies for each phase (1) training and (2) serving. You do not have to install both. 
@@ -58,6 +53,7 @@ We have different dependencies for each phase (1) training and (2) serving. You 
 ```bash
 chmod +x setup.sh
 ./setup.sh
+source .venv/bin/activate
 ```
 
 #### Option 2: Manual (for training)
@@ -75,27 +71,28 @@ pip install --upgrade pip setuptools wheel
 
 3.3. Install PyTorch (for CUDA>13.0)
 ```bash
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cu124
 ```
 
-otherwise:
+3.4. Install remaining dependencies
 ```bash
-# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install triton==3.1.0 bitsandbytes==0.43.3
 ```
 
-3.4. Verify installation
+3.5. Verify installation
 ```bash
-python3 << 'EOF'
-import torch
-print(f"PyTorch: {torch.__version__}")
-print(f"CUDA: {torch.version.cuda}")
-print(f"GPU Available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+python << 'EOF'
+import torch, bitsandbytes as bnb, triton
+print(f"✓ PyTorch {torch.__version__}")
+print(f"✓ CUDA {torch.version.cuda}")
+print(f"✓ triton {triton.__version__}")
+print(f"✓ bitsandbytes {bnb.__version__}")
+print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
 EOF
 ```
 
-3.5. Install remaining dependencies
+3.6. Install remaining dependencies
 ```bash
 pip install -r requirements_training.txt
 ```
@@ -114,8 +111,20 @@ pip install -r requirements_serving.txt
 
 4.  (for training): **Start training**
 ```bash
-python3 src/hal_det/training/train.py
+python3 src/hal_det/training/train.py --output_dir ./data/outputs
 ```
+
+# Quick test (1% of epoch)
+```bash
+python src/hal_det/training/train.py --output_dir ./test --num_train_epochs 0.01
+```
+
+
+# Resume from checkpoint
+```bash
+python src/hal_det/training/train.py --output_dir ./data/outputs --resume_from_checkpoint ./data/outputs/checkpoint-500
+```
+
 4.  (for serving):
 **Run the Service**
     ```bash

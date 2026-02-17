@@ -1,42 +1,36 @@
-# VeNRA Training Environment Requirements
+# VeNRA Training Environment Requirements (CORRECTED)
 # Python 3.11.x on Ubuntu 24.04.3 LTS
 # NVIDIA Driver with CUDA 13.1 support
 
-# IMPORTANT: Install PyTorch FIRST with correct CUDA version:
-# Try CUDA 13.0: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
-# Or CUDA 12.8: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-# Or CUDA 12.6: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-
-# Core ML Framework
-# Note: Do NOT install torch via this requirements.txt - use the command above
-# torch>=2.1.0,<2.3.0  # Install separately with correct CUDA version
-# torchvision>=0.16.0,<0.18.0
-# torchaudio>=2.1.0,<2.3.0
+# =============================================================================
+# CRITICAL: PyTorch and triton are installed SEPARATELY first (see setup.sh)
+# Do NOT install them via this requirements.txt
+# =============================================================================
 
 # Transformers Ecosystem
-transformers>=4.36.0,<4.42.0  # Qwen2.5 support requires 4.36+
-datasets>=2.14.0
-tokenizers>=0.15.0
-accelerate>=0.25.0  # Required for multi-GPU and model loading
+transformers==4.46.3      # Qwen2.5-Coder-3B support
+datasets==2.21.0          # Latest stable
+tokenizers==0.20.3        # Matches transformers
+accelerate==0.34.2        # Multi-GPU and model loading support
 
 # Parameter-Efficient Fine-Tuning
-peft>=0.7.0,<0.12.0  # rsLoRA support requires 0.7+
-trl>=0.7.0,<0.9.0    # SFTTrainer with recent bug fixes
+peft==0.13.2              # rsLoRA support
+trl==0.12.2               # SFTTrainer with bug fixes
 
-# Quantization (CRITICAL: Python 3.11 compatibility)
-bitsandbytes>=0.41.0,<0.44.0  # Python 3.11 support starts at 0.41.0
+# Quantization - ALREADY INSTALLED via setup.sh
+# bitsandbytes==0.43.3
 
 # Experiment Tracking
-wandb>=0.16.0
-python-dotenv>=1.0.0
+wandb==0.18.7
+python-dotenv==1.0.1
 
-# Utilities
-numpy>=1.24.0,<2.0.0  # NumPy 2.0 breaks some dependencies
-scipy>=1.11.0
-scikit-learn>=1.3.0
-pandas>=2.0.0
+# Scientific Computing
+numpy==1.26.4             # Pre-2.0 for compatibility
+scipy==1.14.1
+scikit-learn==1.6.1
+pandas==2.2.3
 
-# Optional but Recommended
-sentencepiece>=0.1.99  # For some tokenizers
-protobuf>=3.20.0,<5.0.0  # Avoid protobuf 4.x issues
-einops>=0.7.0  # Required by some attention implementations
+# Tokenizer Support
+sentencepiece==0.2.0
+protobuf==4.25.5
+einops==0.8.0

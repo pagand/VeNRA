@@ -4,7 +4,7 @@ VeNRA Hallucination Judge Training Pipeline (v3.0)
 Phase 1 Implementation: Baseline QLoRA + rsLoRA Training
 
 DEFERRED TO PHASE 2:
-- GaLore scaling to 7B (Section 7.1) - Only if 3B fails precision targets
+- GaLore scaling to 7B (Section 7.1) - Only if 3B fails precision targetsd
 - Hyperparameter grid search (Section 4.2, Table) - Only if baseline underperforms
 - LRSL Logit Reranking (Section 7.2) - Only if systematic bias observed
 - Temperature Scaling for ECE (Section 6.4) - Post-training calibration step
@@ -29,9 +29,33 @@ from peft import LoraConfig, prepare_model_for_kbit_training, TaskType
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import wandb
 from dotenv import load_dotenv
+from transformers import EarlyStoppingCallback
+
+
+load_dotenv()
+
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 
+                      os.getenv('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,max_split_size_mb:512'))
+
 
 # --- Configuration & Defaults ---
+OUTPUT_DIR="./data/output"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-3B-Instruct"
+LEARNING_RATE=2e-4
+LORA_RANK=64
+LORA_ALPHA=32
+MAX_SEQ_LENGTH=4096
+# CUDA Configuration
+CUDA_VISIBLE_DEVICES=0
+PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+#training config
+NUM_TRAIN_EPOCHS=2
+TRAIN_BATCH_SIZE=2
+EVAL_BATCH_SIZE=3
+GRAD_ACCUM_STEP=32
+EVAL_ACCUM_STEP=32
+EVAL_SABOTAGE_BATCH_SIZE=4
+RETRAIN=True
 
 # Orthogonal Token Mapping (Spec Section 3.1)
 TOKEN_MAP = {
@@ -41,27 +65,50 @@ TOKEN_MAP = {
 }
 
 # Sabotage Type Categories (Spec Section 6.2)
-LOGIC_SABOTAGE_TYPES = {"code_lie", "neighbor_trap", "calculation_error"}
+LOGIC_SABOTAGE_TYPES = {"logic_code_lie", "numeric_neighbor_trap", "irrelevancy_rag", "semantic_drift"}
 NATURAL_FAILURE_TYPE = "natural"
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(default=DEFAULT_MODEL_ID)
-    lora_rank: int = field(default=64, metadata={"help": "LoRA Rank (r). Spec default: 64"})
-    lora_alpha: int = field(default=32, metadata={"help": "LoRA Alpha. Spec default: 32 (rsLoRA)"})
-    learning_rate: float = field(default=2e-4, metadata={"help": "LR. Spec default: 2e-4"})
+    """Model configuration arguments (no conflicts with TrainingArguments)."""
+    model_name_or_path: str = field(
+        default=DEFAULT_MODEL_ID,
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    lora_rank: int = field(
+        default=LORA_RANK,
+        metadata={"help": "LoRA Rank (r). Spec default: 64"}
+    )
+    lora_alpha: int = field(
+        default=LORA_ALPHA,
+        metadata={"help": "LoRA Alpha. Spec default: 32 (rsLoRA)"}
+    )
+    # NOTE: learning_rate moved to TrainingArguments to avoid conflict
 
 def check_env_vars():
-    """Load and validate environment variables from .env file (Spec requirement)."""
-    load_dotenv()  # Load from .env file
+    """Load and validate environment variables from .env file."""
     
     if "HF_TOKEN" not in os.environ:
         raise ValueError(
             "CRITICAL: HF_TOKEN not found in environment variables.\n"
             "Please add HF_TOKEN=hf_xxx to your .env file."
         )
+    
+    # Set HF token for model downloads
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+    
     if "WANDB_API_KEY" not in os.environ:
         print("Warning: WANDB_API_KEY not found. Logging will be local only.")
+        # Disable wandb if no API key
+        os.environ["WANDB_MODE"] = "offline"
+    else:
+        # Set WandB env vars for trainer integration
+        if "WANDB_ENTITY" in os.environ:
+            os.environ["WANDB_ENTITY"] = os.getenv("WANDB_ENTITY")
+        if "WANDB_PROJECT" in os.environ:
+            os.environ["WANDB_PROJECT"] = os.getenv("WANDB_PROJECT")
+        if "WANDB_DIR" in os.environ:
+            os.makedirs(os.getenv("WANDB_DIR"), exist_ok=True)
 
 # --- Custom Callback: Stratified Sabotage Audit ---
 class SabotageEvalCallback(TrainerCallback):
@@ -102,12 +149,12 @@ class SabotageEvalCallback(TrainerCallback):
             if parent and child:
                 # Extract metadata
                 t_count = parent.get('meta', {}).get('token_count', 0)
-                sabotage_type = child.get('sabotage_type', 'unknown')  # Top-level field!
+                sabotage_type = child.get('sabotage_type', 'unknown')
                 
                 pair = (parent, child)
                 
-                # Stratify by BOTH dimensions (Spec Section 6.2)
-                is_long = t_count >= 1024  # CORRECTED: Spec says < 1024 for short
+                # Stratify by BOTH dimensions
+                is_long = t_count >= 1024
                 is_logic = sabotage_type in LOGIC_SABOTAGE_TYPES
                 
                 if is_long and is_logic:
@@ -131,13 +178,19 @@ class SabotageEvalCallback(TrainerCallback):
         print(f"  Long + Natural:  {len(self.pairs_long_natural)}")
         print(f"  Long + Logic:    {len(self.pairs_long_logic)}")
 
-    def on_evaluate(self, args, state, control, model, **kwargs):
-        model.eval()
-        
+    def clear_gpu_memory(self):
+        """Aggressively clear GPU cache."""
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print(f"GPU Memory: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB allocated")
+    
+
+    def on_evaluate(self, args, state, control, model, metrics=None, **kwargs):
+        model.eval()        
         # Helper to run eval on a specific list of pairs
-        def evaluate_subset(pairs, prefix):
+        def evaluate_subset(pairs):
             if not pairs: 
-                return 0.0, 0.0
+                return 0.0, 0.0, 0.0, 0.0
             
             prompts = []
             ece_labels = []
@@ -152,7 +205,7 @@ class SabotageEvalCallback(TrainerCallback):
                 return_tensors="pt", 
                 padding=True, 
                 truncation=True,
-                max_length=4096
+                max_length=MAX_SEQ_LENGTH
             ).to(model.device)
             
             with torch.no_grad():
@@ -167,27 +220,65 @@ class SabotageEvalCallback(TrainerCallback):
             predictions = torch.argmax(probs, dim=-1).cpu().numpy()
             confidences = torch.max(probs, dim=-1).values.cpu().numpy()
             
-            # Flip Rate (Paired Sensitivity - Spec Section 6.2, Metric 3)
+            # Flip Rate (Paired Sensitivity)
             correct_flips = 0
             for i in range(len(pairs)):
-                parent_correct = predictions[i*2] == 0      # Should predict Found
-                child_correct = predictions[i*2 + 1] == 1   # Should predict Fake
+                parent_correct = predictions[i*2] == 0
+                child_correct = predictions[i*2 + 1] == 1
                 if parent_correct and child_correct:
                     correct_flips += 1
             flip_rate = correct_flips / len(pairs) if len(pairs) > 0 else 0.0
             
-            # ECE (Expected Calibration Error - Spec Section 6.4, Metric 7)
+            # ECE (Expected Calibration Error)
             accuracies = (predictions == np.array(ece_labels)).astype(float)
             ece = np.abs(confidences - accuracies).mean()
+            # Track per-label accuracy
+            parent_acc = (predictions[::2] == 0).mean()  # "Found" accuracy
+            child_acc = (predictions[1::2] == 1).mean()  # "Fake" accuracy
+            del inputs, outputs, next_token_logits, probs
+            return flip_rate, ece, parent_acc, child_acc
+
+        def evaluate_subset_batched(pairs, batch_size=EVAL_SABOTAGE_BATCH_SIZE):
+            """Process pairs in mini-batches if list is too large."""
+            self.clear_gpu_memory()
+            if len(pairs) <= batch_size:
+                # Small enough - process all at once
+                return evaluate_subset(pairs)
             
-            return flip_rate, ece
+            # Too large - split into batches
+            all_flip_rates = []
+            all_eces = []
+            all_parent_accs = [] 
+            all_child_accs = []   
+            all_pair_counts = []
+            
+            for batch_start in range(0, len(pairs), batch_size):
+                batch_end = min(batch_start + batch_size, len(pairs))
+                batch_pairs = pairs[batch_start:batch_end]
+                
+                fr, ece, parent_acc, child_acc = evaluate_subset(batch_pairs)  # FIX: Unpack 4 values
+                
+                all_flip_rates.append(fr)
+                all_eces.append(ece)
+                all_parent_accs.append(parent_acc)
+                all_child_accs.append(child_acc)
+                all_pair_counts.append(len(batch_pairs))
+            
+            # Weighted average across batches
+            total_pairs = sum(all_pair_counts)
+            avg_flip_rate = sum(fr * count for fr, count in zip(all_flip_rates, all_pair_counts)) / total_pairs
+            avg_ece = sum(ece * count for ece, count in zip(all_eces, all_pair_counts)) / total_pairs
+            avg_parent_acc = sum(pa * count for pa, count in zip(all_parent_accs, all_pair_counts)) / total_pairs  # NEW
+            avg_child_acc = sum(ca * count for ca, count in zip(all_child_accs, all_pair_counts)) / total_pairs    # NEW
+            
+            return avg_flip_rate, avg_ece, avg_parent_acc, avg_child_acc
 
         # Run Stratified Audit (2x2 grid)
-        fr_short_nat, ece_short_nat = evaluate_subset(self.pairs_short_natural, "short_nat")
-        fr_short_log, ece_short_log = evaluate_subset(self.pairs_short_logic, "short_log")
-        fr_long_nat, ece_long_nat = evaluate_subset(self.pairs_long_natural, "long_nat")
-        fr_long_log, ece_long_log = evaluate_subset(self.pairs_long_logic, "long_log")
-        
+        fr_short_nat, ece_short_nat, pa_short_nat, ca_short_nat = evaluate_subset_batched(self.pairs_short_natural)
+        fr_short_log, ece_short_log, pa_short_log, ca_short_log = evaluate_subset_batched(self.pairs_short_logic)
+        fr_long_nat, ece_long_nat, pa_long_nat, ca_long_nat = evaluate_subset_batched(self.pairs_long_natural)
+        fr_long_log, ece_long_log, pa_long_log, ca_long_log = evaluate_subset_batched(self.pairs_long_logic)
+
         # Marginal Aggregates
         total_short = len(self.pairs_short_natural) + len(self.pairs_short_logic)
         total_long = len(self.pairs_long_natural) + len(self.pairs_long_logic)
@@ -219,12 +310,33 @@ class SabotageEvalCallback(TrainerCallback):
                        fr_long_log * len(self.pairs_long_logic)) / total_logic
         else:
             fr_logic = 0.0
+
+        # Calculate global accuracies (weighted average)
+        total_all = total_short + total_long
+        if total_all > 0:
+            parent_acc_global = (
+                pa_short_nat * len(self.pairs_short_natural) +
+                pa_short_log * len(self.pairs_short_logic) +
+                pa_long_nat * len(self.pairs_long_natural) +
+                pa_long_log * len(self.pairs_long_logic)
+            ) / total_all
+            
+            child_acc_global = (
+                ca_short_nat * len(self.pairs_short_natural) +
+                ca_short_log * len(self.pairs_short_logic) +
+                ca_long_nat * len(self.pairs_long_natural) +
+                ca_long_log * len(self.pairs_long_logic)
+            ) / total_all
+        else:
+            parent_acc_global = 0.0
+            child_acc_global = 0.0
         
-        # Global metric (for model selection - Spec Section 4.1)
+        # Global metric (for model selection)
         if total_all > 0:
             fr_global = (fr_short * total_short + fr_long * total_long) / total_all
         else:
             fr_global = 0.0
+
 
         print(f"\n[Sabotage Audit] Step {state.global_step}:")
         print(f"  Short Context (< 1024 tok): Overall={fr_short:.2%}")
@@ -237,33 +349,47 @@ class SabotageEvalCallback(TrainerCallback):
         print(f"    ├─ Natural: {fr_natural:.2%}")
         print(f"    └─ Logic:   {fr_logic:.2%}")
         print(f"  GLOBAL FLIP RATE: {fr_global:.2%}")
-        
-        if wandb.run:
-            # CORRECTED: Use 'eval_' prefix to match training_args.metric_for_best_model
+
+        self.clear_gpu_memory()
+        if wandb.run is not None:
             wandb.log({
-                # Global metric (for checkpoint selection)
+                    "eval_audit/flip_rate_global": fr_global,
+                    "eval_audit/flip_rate_short": fr_short,
+                    "eval_audit/flip_rate_long": fr_long,
+                    "eval_audit/flip_rate_natural": fr_natural,
+                    "eval_audit/flip_rate_logic": fr_logic,
+                    "eval_audit/flip_rate_short_natural": fr_short_nat,
+                    "eval_audit/flip_rate_short_logic": fr_short_log,
+                    "eval_audit/flip_rate_long_natural": fr_long_nat,
+                    "eval_audit/flip_rate_long_logic": fr_long_log,
+                    "eval_audit/ece_short_natural": ece_short_nat,
+                    "eval_audit/ece_short_logic": ece_short_log,
+                    "eval_audit/ece_long_natural": ece_long_nat,
+                    "eval_audit/ece_long_logic": ece_long_log,
+                    "eval_audit/accuracy_found": parent_acc_global,
+                    "eval_audit/accuracy_fake": child_acc_global,
+                }, step=state.global_step+1)
+            print(f"✓ Logged metrics to wandb at step {state.global_step+1}")
+        if metrics is not None:
+            metrics.update( {
                 "eval_audit/flip_rate_global": fr_global,
-                
-                # Marginal metrics (for analysis)
                 "eval_audit/flip_rate_short": fr_short,
                 "eval_audit/flip_rate_long": fr_long,
                 "eval_audit/flip_rate_natural": fr_natural,
                 "eval_audit/flip_rate_logic": fr_logic,
-                
-                # Fine-grained 2x2 grid
                 "eval_audit/flip_rate_short_natural": fr_short_nat,
                 "eval_audit/flip_rate_short_logic": fr_short_log,
                 "eval_audit/flip_rate_long_natural": fr_long_nat,
                 "eval_audit/flip_rate_long_logic": fr_long_log,
-                
-                # Calibration metrics
                 "eval_audit/ece_short_natural": ece_short_nat,
                 "eval_audit/ece_short_logic": ece_short_log,
                 "eval_audit/ece_long_natural": ece_long_nat,
                 "eval_audit/ece_long_logic": ece_long_log,
-                
-                "global_step": state.global_step
-            })
+                "eval_audit/accuracy_found": parent_acc_global,
+                "eval_audit/accuracy_fake": child_acc_global,
+                "global_step": state.global_step+1
+                })
+        
         
     def _make_prompt(self, example):
         """Format input for inference (no completion part)."""
@@ -279,58 +405,80 @@ class SabotageEvalCallback(TrainerCallback):
             f"<|im_start|>assistant\nLabel:"
         )
 
-# --- Standard Formatting Function ---
-def format_prompt_func(example):
-    """
-    Format training examples with Label-First structure (SALSA Framework - Spec Section 3.2).
-    Loss is calculated ONLY on the Label token via DataCollatorForCompletionOnlyLM.
-    """
+def format_prompt_func(example, tokenizer, max_seq_length=MAX_SEQ_LENGTH):
+    """Format with smart context truncation."""
     output_texts = []
     batch_size = len(example['split'])
     
     for i in range(batch_size):
-        raw_label = example['label'][i] 
+        raw_label = example['label'][i]
         target_token = TOKEN_MAP.get(raw_label)
-        if not target_token: 
+        if not target_token:
             continue
-
+        
         q = example['input_components'][i]['query']
         c_raw = example['input_components'][i]['context']
         c = "\n".join(c_raw) if isinstance(c_raw, list) else str(c_raw)
         t = example['input_components'][i]['trace']
         s = example['output_components'][i]['target_sentence']
         r = example['output_components'][i]['reasoning']
-
-        # Spec Section 3.2: Label-First Template
-        prompt = (
-            f"<|im_start|>system\nYou are a financial auditor.<|im_end|>\n"
-            f"<|im_start|>user\nQuery: {q}\nContext: {c}\nTrace: {t}\nStatement: {s}\n"
-            f"Task: Classify [Found, Fake, General].<|im_end|>\n"
-            f"<|im_start|>assistant\nLabel:"
-        )
-        completion = f"{target_token}\nAnalysis: {r}<|im_end|>"
-        output_texts.append(prompt + completion)
         
+        # Essential parts (never truncate)
+        system_msg = "<|im_start|>system\nYou are a financial auditor.<|im_end|>\n"
+        user_prefix = f"<|im_start|>user\nQuery: {q}\n"
+        user_suffix = f"Trace: {t}\nStatement: {s}\nTask: Classify [Found, Fake, General].<|im_end|>\n<|im_start|>assistant\nLabel:"
+        completion = f"{target_token}\nAnalysis: {r}<|im_end|>"
+        
+        # Calculate budget
+        essential = system_msg + user_prefix + user_suffix + completion
+        essential_tokens = len(tokenizer.encode(essential, add_special_tokens=False))
+        context_budget = max_seq_length - essential_tokens - 20
+        
+        # Truncate context if needed
+        if context_budget > 50:
+            context_text = f"Context: {c}\n"
+            context_tokens = tokenizer.encode(context_text, add_special_tokens=False)
+            if len(context_tokens) > context_budget:
+                context_tokens = context_tokens[:context_budget]
+                context_text = tokenizer.decode(context_tokens, skip_special_tokens=True) + "\n"
+        else:
+            context_text = "Context: [Truncated]\n"
+        
+        full_text = system_msg + user_prefix + context_text + user_suffix + completion
+        output_texts.append(full_text)
+    
     return output_texts
 
 def main():
+    # Parse arguments
     parser = HfArgumentParser((ModelArguments, TrainingArguments))
-    model_args, training_args = parser.parse_args_into_dataclasses()
     
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # Load from JSON config file
+        model_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        # Parse from command line
+        model_args, training_args = parser.parse_args_into_dataclasses()
+    
+    # Check environment variables
     check_env_vars()
     
-    print(f"Loading dataset pagand/venra (v2.1)...")
-    dataset = load_dataset("pagand/venra", revision="v2.1")
+    print(f"Loading dataset pagand/venra (v2.2)...")
+    dataset = load_dataset("pagand/venra", revision="v2.2")
+    
+    # Handle different split naming conventions
+    eval_split = "validation" if "validation" in dataset else "val"
     
     print(f"Initializing tokenizer: {model_args.model_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path, 
-        trust_remote_code=True
+        trust_remote_code=True,
+        token=os.environ.get("HF_TOKEN")
     )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right" 
     
-    # Verify Orthogonal Token Mapping (Spec Section 3.1)
+    # Verify Orthogonal Token Mapping
     print("Verifying Orthogonal Token Mapping...")
     token_map_ids = {}
     for k, v in TOKEN_MAP.items():
@@ -339,12 +487,12 @@ def main():
             raise ValueError(
                 f"CRITICAL: Token '{v}' for label '{k}' is fragmented into {len(ids)} tokens!\n"
                 f"Token IDs: {ids}\n"
-                f"This violates the Orthogonal Label requirement (Spec Section 3.1)."
+                f"This violates the Orthogonal Label requirement."
             )
         token_map_ids[k] = ids[0]
         print(f"  {k:12s} -> '{v}' (ID: {ids[0]})")
     
-    # Spec Section 2.2: 4-bit NF4 Quantization
+    # 4-bit NF4 Quantization
     print("Configuring 4-bit NF4 Quantization...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -359,11 +507,12 @@ def main():
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
-        use_cache=False  # Required for gradient checkpointing
+        use_cache=False,  # Required for gradient checkpointing
+        token=os.environ.get("HF_TOKEN")
     )
     model = prepare_model_for_kbit_training(model)
 
-    # Spec Section 2.2: rsLoRA Configuration
+    # rsLoRA Configuration
     print(f"Configuring rsLoRA (r={model_args.lora_rank}, alpha={model_args.lora_alpha})...")
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -371,7 +520,7 @@ def main():
         r=model_args.lora_rank,
         lora_alpha=model_args.lora_alpha,
         lora_dropout=0.05,
-        use_rslora=True,  # Rank-Stabilized LoRA (Spec Section 2.2)
+        use_rslora=True,
         bias="none",
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
@@ -379,15 +528,22 @@ def main():
         ]
     )
 
-    # --- Training Args (Spec Section 4.1: The "Recipe") ---
+    # Set default training arguments if not provided
+    if training_args.output_dir == "tmp":  # Default value from TrainingArguments
+        training_args.output_dir = OUTPUT_DIR
+    
+    # Training configuration
     print("Configuring Training Arguments...")
-    training_args.num_train_epochs = 1.0  # STRICT: Prevent sabotage algorithm overfitting
-    training_args.per_device_train_batch_size = 4
-    training_args.gradient_accumulation_steps = 8  # Effective batch = 32
-    training_args.learning_rate = model_args.learning_rate
+    training_args.num_train_epochs = NUM_TRAIN_EPOCHS
+    training_args.per_device_train_batch_size = TRAIN_BATCH_SIZE
+    training_args.per_device_eval_batch_size = EVAL_BATCH_SIZE
+    training_args.gradient_accumulation_steps = GRAD_ACCUM_STEP
+    training_args.eval_accumulation_steps = EVAL_ACCUM_STEP
+    training_args.learning_rate = LEARNING_RATE
+    
     training_args.lr_scheduler_type = "cosine"
     training_args.warmup_ratio = 0.03
-    training_args.logging_steps = 10
+    training_args.logging_steps = 10 # Track learning rate
     
     training_args.evaluation_strategy = "steps"
     training_args.eval_steps = 50 
@@ -395,35 +551,46 @@ def main():
     training_args.save_steps = 50
     training_args.load_best_model_at_end = True
     
-    # Model selection based on Paired Flip Rate (Spec Section 6.2, Metric 3)
+    # Model selection based on Paired Flip Rate
     training_args.metric_for_best_model = "eval_audit/flip_rate_global"
     training_args.greater_is_better = True
     
-    training_args.optim = "paged_adamw_8bit"  # Memory efficient optimizer
+    training_args.optim = "paged_adamw_8bit"
     training_args.report_to = ["wandb"]
-    training_args.run_name = f"venra-v3-r{model_args.lora_rank}-lr{model_args.learning_rate}"
-    training_args.bf16 = True  # BFloat16 for Ampere GPUs (RTX 3090)
+    training_args.run_name = f"venra-v3-r{model_args.lora_rank}-lr{training_args.learning_rate}"
+    training_args.bf16 = True
     training_args.max_grad_norm = 0.3
     
-    # Memory optimizations for long context (10-K filings)
+    # Memory optimizations
     training_args.gradient_checkpointing = True 
-    training_args.group_by_length = True  # Prevent training bias in 1-epoch regime
+    training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
+    training_args.group_by_length = True
+    
+    # Create output directory
+    os.makedirs(training_args.output_dir, exist_ok=True)
     
     print("Initializing Sabotage Evaluation Callback...")
-    sabotage_cb = SabotageEvalCallback(dataset['val'], tokenizer, token_map_ids)
+    sabotage_cb = SabotageEvalCallback(dataset[eval_split], tokenizer, token_map_ids)
 
+    callbacks=[
+    sabotage_cb,
+    EarlyStoppingCallback(
+        early_stopping_patience=3,  # Stop if no improvement for 3 evals
+        early_stopping_threshold=0.01  # Min improvement = 1%
+    )
+    ]
     print("Initializing SFTTrainer...")
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["val"],
+        eval_dataset=dataset[eval_split],
         peft_config=peft_config,
-        formatting_func=format_prompt_func,
+        formatting_func=lambda ex: format_prompt_func(ex, tokenizer, MAX_SEQ_LENGTH),
         data_collator=DataCollatorForCompletionOnlyLM(
-            response_template="\nLabel:",  # Loss calculated only on completion
+            response_template="\nLabel:", #question?!
             tokenizer=tokenizer
         ),
-        max_seq_length=4096,  # Support 10-K filing context
+        max_seq_length=MAX_SEQ_LENGTH,
         tokenizer=tokenizer,
         args=training_args,
         callbacks=[sabotage_cb]
@@ -434,19 +601,45 @@ def main():
     print("="*80)
     print(f"Model: {model_args.model_name_or_path}")
     print(f"LoRA Config: r={model_args.lora_rank}, alpha={model_args.lora_alpha}, rsLoRA=True")
-    print(f"Learning Rate: {model_args.learning_rate}")
+    print(f"Learning Rate: {training_args.learning_rate}")
     print(f"Effective Batch Size: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
     print(f"Epochs: {training_args.num_train_epochs}")
+    print(f"Output Dir: {training_args.output_dir}")
     print(f"Target Metric: {training_args.metric_for_best_model}")
     print("="*80 + "\n")
-    
-    trainer.train()
+
+
+    # Run evaluation BEFORE training
+    print("\n" + "="*80)
+    print("PRE-TRAINING EVALUATION (Baseline)")
+    print("="*80)
+    eval_results = trainer.evaluate()
+    print(f"Baseline metrics: {eval_results}")
+    print("="*80 + "\n")
+
+    checkpoint_dir = None
+    if os.path.exists(training_args.output_dir):
+        checkpoints = [d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")]
+        if checkpoints and RETRAIN:
+            latest = max(checkpoints, key=lambda x: int(x.split("-")[1]))
+            checkpoint_dir = os.path.join(training_args.output_dir, latest)
+            print(f"Resuming from {checkpoint_dir}")
+            trainer.train(resume_from_checkpoint=checkpoint_dir)
+        else:
+            print("Training from beginning")
+            trainer.train()
     
     print("\n" + "="*80)
     print("PHASE 1 COMPLETE: Saving Best Model...")
     print("="*80)
+    
+    # Save the final model
     trainer.save_model(training_args.output_dir)
     
+    # Save tokenizer
+    tokenizer.save_pretrained(training_args.output_dir)
+    
+    print(f"\n✅ Model saved to: {training_args.output_dir}")
     print("\nPHASE 2 CONTINGENCIES (Only if Phase 1 fails targets):")
     print("  1. GaLore for 7B scaling (if Precision < 90% on code_lie)")
     print("  2. Hyperparameter grid (if Recall < 85% on neighbor_trap)")

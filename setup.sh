@@ -1,6 +1,7 @@
 #!/bin/bash
-# VeNRA Training Environment Setup Script
+# VeNRA Training Environment Setup Script (CORRECTED)
 # For Ubuntu 24.04.3 LTS with Python 3.11.x
+# Fixes PyTorch/triton/bitsandbytes dependency conflicts
 
 set -e  # Exit on error
 
@@ -30,7 +31,7 @@ if [ -f /etc/os-release ]; then
 fi
 
 # Check Python version
-echo -e "${GREEN}[1/8] Checking Python 3.11...${NC}"
+echo -e "${GREEN}[1/9] Checking Python 3.11...${NC}"
 if command -v python3.11 &> /dev/null; then
     PYTHON_VERSION=$(python3.11 --version | awk '{print $2}')
     echo "✓ Found Python $PYTHON_VERSION"
@@ -43,7 +44,7 @@ else
 fi
 
 # Install system dependencies
-echo -e "${GREEN}[2/8] Installing system dependencies...${NC}"
+echo -e "${GREEN}[2/9] Installing system dependencies...${NC}"
 sudo apt update
 sudo apt install -y \
     build-essential \
@@ -57,7 +58,7 @@ sudo apt install -y \
     curl
 
 # Check NVIDIA driver
-echo -e "${GREEN}[3/8] Checking NVIDIA GPU...${NC}"
+echo -e "${GREEN}[3/9] Checking NVIDIA GPU...${NC}"
 if command -v nvidia-smi &> /dev/null; then
     nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
     echo "✓ NVIDIA driver detected"
@@ -70,7 +71,7 @@ else
 fi
 
 # Check CUDA
-echo -e "${GREEN}[4/8] Checking CUDA...${NC}"
+echo -e "${GREEN}[4/9] Checking CUDA...${NC}"
 
 # Get driver CUDA version from nvidia-smi
 if nvidia-smi &> /dev/null; then
@@ -78,10 +79,8 @@ if nvidia-smi &> /dev/null; then
     echo "✓ NVIDIA Driver supports CUDA: $DRIVER_CUDA"
     
     # Explain backward compatibility
-    if [[ "$DRIVER_CUDA" > "12.0" ]]; then
-        echo "  Note: Driver CUDA $DRIVER_CUDA is backward compatible with PyTorch CUDA 12.1"
-        echo "  We'll use PyTorch built for CUDA 12.1 (most stable)"
-    fi
+    echo "  Note: We'll use PyTorch with CUDA 12.4 (stable and backward compatible)"
+    echo "  Your CUDA $DRIVER_CUDA driver can run CUDA 12.4 code perfectly"
 fi
 
 # Check if CUDA toolkit is installed (optional)
@@ -93,45 +92,56 @@ else
 fi
 
 # Create virtual environment
-echo -e "${GREEN}[5/8] Creating virtual environment...${NC}"
-if [ -d "venv" ]; then
-    echo -e "${YELLOW}venv directory already exists. Remove? (y/n)${NC}"
+echo -e "${GREEN}[5/9] Creating virtual environment...${NC}"
+if [ -d "venv" ] || [ -d ".venv" ]; then
+    echo -e "${YELLOW}Virtual environment already exists. Remove and recreate? (y/n)${NC}"
     read -r response
     if [[ "$response" =~ ^[Yy]$ ]]; then
-        rm -rf venv
+        rm -rf venv .venv
     else
         echo "Using existing venv..."
+        if [ -d "venv" ]; then
+            source venv/bin/activate
+        else
+            source .venv/bin/activate
+        fi
+        echo -e "${YELLOW}Skipping to dependency installation...${NC}"
+        # Skip to step 6
     fi
 fi
 
-if [ ! -d "venv" ]; then
-    python3.11 -m venv venv
+if [ ! -d "venv" ] && [ ! -d ".venv" ]; then
+    python3.11 -m venv .venv
+    source .venv/bin/activate
     echo "✓ Virtual environment created"
+else
+    if [ -d "venv" ]; then
+        source venv/bin/activate
+    else
+        source .venv/bin/activate
+    fi
 fi
-
-# Activate venv
-source venv/bin/activate
 
 # Upgrade pip
-echo -e "${GREEN}[6/8] Upgrading pip, setuptools, wheel...${NC}"
+echo -e "${GREEN}[6/9] Upgrading pip, setuptools, wheel...${NC}"
 pip install --upgrade pip setuptools wheel
 
-# Install PyTorch with CUDA
-echo -e "${GREEN}[7/8] Installing PyTorch with CUDA...${NC}"
+# CRITICAL: Install PyTorch 2.5.1 with CUDA 12.4
+echo -e "${GREEN}[7/9] Installing PyTorch 2.5.1 with CUDA 12.4...${NC}"
+echo ""
+echo "=========================================="
+echo "IMPORTANT: Using PyTorch 2.5.1+cu124"
+echo "This is the stable version that works with"
+echo "triton 3.1.0 and bitsandbytes 0.43.3"
+echo "=========================================="
+echo ""
 
-# Determine best CUDA version
-echo "Your driver supports CUDA $DRIVER_CUDA"
-echo "Attempting to install PyTorch with CUDA 13.0 (closest to your driver)..."
-
-# Try cu130 first, fall back to cu128 if it fails
-if pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 2>/dev/null; then
-    echo "✓ Successfully installed PyTorch with CUDA 13.0"
-else
-    echo "CUDA 13.0 build not available, falling back to CUDA 12.8 (latest stable)..."
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-fi
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cu124
 
 # Verify CUDA in PyTorch
+echo ""
+echo "Verifying PyTorch installation..."
 python << 'EOF'
 import torch
 if not torch.cuda.is_available():
@@ -142,10 +152,41 @@ else:
     print(f"✓ PyTorch {torch.__version__}")
     print(f"✓ CUDA {torch.version.cuda}")
     print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
+    print(f"✓ GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+EOF
+
+# Install triton 3.1.0 (the Goldilocks version)
+echo -e "${GREEN}[8/9] Installing triton 3.1.0...${NC}"
+pip install triton==3.1.0
+
+# Install bitsandbytes 0.43.3
+echo ""
+echo "Installing bitsandbytes 0.43.3..."
+pip install bitsandbytes==0.43.3
+
+# Verify bitsandbytes
+echo ""
+echo "Verifying bitsandbytes installation..."
+python << 'EOF'
+import torch
+import bitsandbytes as bnb
+
+print(f"✓ bitsandbytes: {bnb.__version__}")
+
+# Test 8-bit quantization
+try:
+    from bitsandbytes.nn import Linear8bitLt
+    test = Linear8bitLt(128, 128, has_fp16_weights=False)
+    if torch.cuda.is_available():
+        test = test.cuda()
+    print("✓ 8-bit quantization works!")
+except Exception as e:
+    print(f"\033[0;31m✗ Quantization test failed: {e}\033[0m")
+    exit(1)
 EOF
 
 # Install remaining dependencies
-echo -e "${GREEN}[8/8] Installing remaining dependencies...${NC}"
+echo -e "${GREEN}[9/9] Installing remaining dependencies...${NC}"
 pip install -r requirements_training.txt
 
 # Create .env template if it doesn't exist
@@ -170,7 +211,7 @@ else
     echo "✓ .env file already exists"
 fi
 
-# Run verification
+# Run comprehensive verification
 echo ""
 echo "=========================================="
 echo "Running Environment Verification..."
@@ -202,6 +243,13 @@ if torch.cuda.is_available():
     print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
     print(f"✓ GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
+# Check triton
+try:
+    import triton
+    print(f"✓ Triton: {triton.__version__}")
+except Exception as e:
+    print(f"✗ Triton: {e}")
+
 # Libraries
 print(f"✓ Transformers: {transformers.__version__}")
 print(f"✓ PEFT: {peft.__version__}")
@@ -224,11 +272,21 @@ else:
     print(f"⚠ WANDB_API_KEY: NOT SET (optional, edit .env file)")
 
 print("="*60)
+
+# Functional test
+print("\n--- Functional Tests ---")
+try:
+    from bitsandbytes.nn import Linear8bitLt
+    test = Linear8bitLt(256, 256, has_fp16_weights=False).cuda()
+    print("✓ 8-bit quantization works!")
+except Exception as e:
+    print(f"✗ Quantization failed: {e}")
+
 print("\n✅ Setup Complete!")
 print("\nNext Steps:")
 print("1. Edit .env file with your HF_TOKEN and WANDB_API_KEY")
-print("2. Activate environment: source venv/bin/activate")
-print("3. Run training: python train_venra_v3_corrected.py")
+print("2. Activate environment: source .venv/bin/activate")
+print("3. Run training: python train_venra.py")
 print("="*60 + "\n")
 EOF
 
@@ -237,8 +295,13 @@ echo -e "${GREEN}=========================================="
 echo "Setup Complete!"
 echo "==========================================${NC}"
 echo ""
+echo "Installed versions:"
+echo "  - PyTorch: 2.5.1+cu124"
+echo "  - triton: 3.1.0"
+echo "  - bitsandbytes: 0.43.3"
+echo ""
 echo "To start training:"
 echo "  1. Edit .env with your tokens"
-echo "  2. source venv/bin/activate"
-echo "  3. python train_venra_v3_corrected.py"
+echo "  2. source .venv/bin/activate  (or source venv/bin/activate)"
+echo "  3. python train.py"
 echo ""
