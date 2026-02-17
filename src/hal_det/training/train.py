@@ -589,7 +589,7 @@ def main():
     )
 
     # Set default training arguments if not provided
-    if training_args.output_dir == "tmp":  # Default value from TrainingArguments
+    if training_args.output_dir in ("tmp", None):  # Default value from TrainingArguments
         training_args.output_dir = OUTPUT_DIR
     
     # Training configuration
@@ -599,10 +599,12 @@ def main():
     training_args.per_device_eval_batch_size = EVAL_BATCH_SIZE
     training_args.gradient_accumulation_steps = GRAD_ACCUM_STEP
     training_args.eval_accumulation_steps = EVAL_ACCUM_STEP
-    training_args.learning_rate = LEARNING_RATE
+    if training_args.learning_rate == 5e-5:   # HF default → user didn't set it
+        training_args.learning_rate = LEARNING_RATE
     
     training_args.lr_scheduler_type = "cosine"
-    training_args.warmup_ratio = 0.1  #was 0.03
+    if training_args.warmup_ratio == 0.0:     # HF default → user didn't set it
+        training_args.warmup_ratio = 0.1  #was 0.03
     training_args.logging_steps = 10 # Track learning rate
     
     training_args.evaluation_strategy = "steps"
@@ -617,7 +619,12 @@ def main():
     
     training_args.optim = "paged_adamw_8bit"
     training_args.report_to = ["wandb"]
-    training_args.run_name = f"venra-v3-r{model_args.lora_rank}-lr{training_args.learning_rate}"
+    if not training_args.run_name:
+        training_args.run_name = (
+            f"venra-v3-r{model_args.lora_rank}"
+            f"-lr{training_args.learning_rate}"
+            f"-w{training_args.warmup_ratio}"
+        )    
     training_args.bf16 = True
     training_args.max_grad_norm = 0.3
     

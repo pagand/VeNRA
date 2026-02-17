@@ -3,14 +3,13 @@
 #SBATCH --gres=gpu:1         # Request 4 GPU "generic resource"
 #SBATCH --time=3-00:00:00       # Max job time is 3 hours
 #SBATCH --output=%N-%j.out   # Terminal output to file named (hostname)-(jobid).out
-#SBATCH --partition=long     # long partition (allows up to 7 days runtime)
 #SBATCH --nodelist=cs-venus-09   # if needed, set the node you want (similar to -w xyz)
 #SBATCH --mem=64GB
 #SBATCH --cpus-per-task=8
 
 
 # Your experiment setup logic here
-source ~/anaconda3/etc/profile.d/conda.sh
+source ~/miniconda3/etc/profile.d/conda.sh
 conda activate .env
 # conda activate hcl-env
 hostname
@@ -24,4 +23,4 @@ export PYOPENGL_PLATFORM=egl
 nvidia-smi
 ulimit -u 1029439
 
-srun python -u src/hal_det/training/train.py  --output_dir ./data/output  --job-dir=./data/output/log --device=0
+srun python -u src/hal_det/training/train.py  --output_dir ./data/output
