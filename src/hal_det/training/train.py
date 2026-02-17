@@ -38,24 +38,26 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF',
                       os.getenv('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,max_split_size_mb:512'))
 
 
-# --- Configuration & Defaults ---
+# ---------------------------------------------------------------------------
+# Configuration & Defaults
+# ---------------------------------------------------------------------------
 OUTPUT_DIR="./data/output"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-3B-Instruct"
-LEARNING_RATE=2e-4
+LEARNING_RATE=5e-5  #was 2e-4
 LORA_RANK=64
 LORA_ALPHA=32
 MAX_SEQ_LENGTH=4096
 # CUDA Configuration
 CUDA_VISIBLE_DEVICES=0
-PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 #training config
-NUM_TRAIN_EPOCHS=2
+NUM_TRAIN_EPOCHS=3
 TRAIN_BATCH_SIZE=2
 EVAL_BATCH_SIZE=3
 GRAD_ACCUM_STEP=32
 EVAL_ACCUM_STEP=32
 EVAL_SABOTAGE_BATCH_SIZE=4
-RETRAIN=True
+RETRAIN=False
+DEBUG=False
 
 # Orthogonal Token Mapping (Spec Section 3.1)
 TOKEN_MAP = {
@@ -67,6 +69,95 @@ TOKEN_MAP = {
 # Sabotage Type Categories (Spec Section 6.2)
 LOGIC_SABOTAGE_TYPES = {"logic_code_lie", "numeric_neighbor_trap", "irrelevancy_rag", "semantic_drift"}
 NATURAL_FAILURE_TYPE = "natural"
+
+def build_prompt(
+    query:    str,
+    context:  str,
+    trace:    str,
+    statement: str,
+    tokenizer,
+    max_seq_length: int = MAX_SEQ_LENGTH,
+    # --- training-only fields (None → inference mode, no completion) ---
+    label_token: Optional[str] = None,
+    reasoning:   Optional[str] = None,
+) -> str:
+    """
+    Build a single prompt with smart context truncation.
+
+    Training mode  : pass label_token + reasoning  → full prompt + completion
+    Inference mode : leave label_token=None         → prompt stops at 'Label:'
+                     (model generates the next token)
+
+    Truncation strategy
+    -------------------
+    All fields except `context` are treated as ESSENTIAL and never truncated.
+    `context` is truncated from the END (the beginning is usually more
+    relevant for financial docs).
+    """
+    system_msg  = "<|im_start|>system\nYou are a financial auditor.<|im_end|>\n"
+    user_prefix = f"<|im_start|>user\nQuery: {query}\n"
+    user_suffix = (
+        f"Trace: {trace}\nStatement: {statement}\n"
+        f"Task: Classify [Found, Fake, General].<|im_end|>\n"
+        f"<|im_start|>assistant\nLabel:"
+    )
+
+    if label_token is not None and reasoning is not None:
+        # Training: completion is part of the sequence
+        completion = f"{label_token}\nAnalysis: {reasoning}<|im_end|>"
+    else:
+        # Inference: no completion
+        completion = ""
+
+    # ---------- budget calculation ----------
+    essential      = system_msg + user_prefix + user_suffix + completion
+    essential_toks = len(tokenizer.encode(essential, add_special_tokens=False))
+    context_budget = max_seq_length - essential_toks - 20   # 20-tok safety margin
+
+    # ---------- context truncation ----------
+    if context_budget > 50:
+        context_text   = f"Context: {context}\n"
+        context_tokens = tokenizer.encode(context_text, add_special_tokens=False)
+        if len(context_tokens) > context_budget:
+            context_tokens = context_tokens[:context_budget]
+            context_text   = tokenizer.decode(context_tokens, skip_special_tokens=True) + "\n"
+    else:
+        context_text = "Context: [Truncated]\n"
+
+    return system_msg + user_prefix + context_text + user_suffix + completion
+
+def format_prompt_func(example, tokenizer, max_seq_length=MAX_SEQ_LENGTH):
+    """Format with smart context truncation."""
+    output_texts = []
+    batch_size = len(example['split'])
+    
+    for i in range(batch_size):
+        raw_label = example['label'][i]
+        label_token = TOKEN_MAP.get(raw_label)
+        if not label_token:
+            continue
+        
+        query     = example['input_components'][i]['query']
+        c_raw     = example['input_components'][i]['context']
+        context   = "\n".join(c_raw) if isinstance(c_raw, list) else str(c_raw)
+        trace     = example['input_components'][i]['trace']
+        statement = example['output_components'][i]['target_sentence']
+        reasoning = example['output_components'][i]['reasoning']
+
+        text = build_prompt(
+            query=query,
+            context=context,
+            trace=trace,
+            statement=statement,
+            tokenizer=tokenizer,
+            max_seq_length=max_seq_length,
+            label_token=label_token,
+            reasoning=reasoning,
+        )
+        output_texts.append(text)
+        
+    
+    return output_texts
 
 @dataclass
 class ModelArguments:
@@ -124,7 +215,7 @@ class SabotageEvalCallback(TrainerCallback):
         
         print("Initializing Sabotage Callback (Building Paired Test Sets)...")
         
-        families = {}
+        families: Dict[str, list] = {}
         for i, row in enumerate(eval_dataset):
             # Safe access to metadata
             meta = row.get('meta', {})
@@ -154,7 +245,7 @@ class SabotageEvalCallback(TrainerCallback):
                 pair = (parent, child)
                 
                 # Stratify by BOTH dimensions
-                is_long = t_count >= 1024
+                is_long = t_count >= 512
                 is_logic = sabotage_type in LOGIC_SABOTAGE_TYPES
                 
                 if is_long and is_logic:
@@ -166,11 +257,11 @@ class SabotageEvalCallback(TrainerCallback):
                 else:  # short + natural
                     self.pairs_short_natural.append(pair)
         
-        # Limit size for speed (30 pairs per category = 120 total examples)
-        self.pairs_short_natural = self.pairs_short_natural[:30]
-        self.pairs_short_logic = self.pairs_short_logic[:30]
-        self.pairs_long_natural = self.pairs_long_natural[:30]
-        self.pairs_long_logic = self.pairs_long_logic[:30]
+        # Limit size for speed (50 pairs cap per category)
+        self.pairs_short_natural = self.pairs_short_natural[:50]
+        self.pairs_short_logic = self.pairs_short_logic[:50]
+        self.pairs_long_natural = self.pairs_long_natural[:50]
+        self.pairs_long_logic = self.pairs_long_logic[:50]
         
         print(f"Sabotage Callback: Stratified Pair Counts:")
         print(f"  Short + Natural: {len(self.pairs_short_natural)}")
@@ -184,6 +275,23 @@ class SabotageEvalCallback(TrainerCallback):
         torch.cuda.synchronize()
         print(f"GPU Memory: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB allocated")
     
+    def _make_prompt(self, example) -> str:
+        """
+        Inference-mode prompt.
+        Calls build_prompt with label_token=None so the sequence ends at 'Label:'
+        and uses the SAME truncation logic as training.
+        """
+        c_raw = example['input_components']['context']
+        return build_prompt(
+            query     = example['input_components']['query'],
+            context   = "\n".join(c_raw) if isinstance(c_raw, list) else str(c_raw),
+            trace     = example['input_components']['trace'],
+            statement = example['output_components']['target_sentence'],
+            tokenizer = self.tokenizer,
+            max_seq_length = MAX_SEQ_LENGTH,
+            label_token = None,   # ← inference mode: no completion
+            reasoning   = None,
+        )
 
     def on_evaluate(self, args, state, control, model, metrics=None, **kwargs):
         model.eval()        
@@ -204,7 +312,7 @@ class SabotageEvalCallback(TrainerCallback):
                 prompts, 
                 return_tensors="pt", 
                 padding=True, 
-                truncation=True,
+                truncation=True, # handled by make_prompt
                 max_length=MAX_SEQ_LENGTH
             ).to(model.device)
             
@@ -212,6 +320,19 @@ class SabotageEvalCallback(TrainerCallback):
                 outputs = model(**inputs)
             
             next_token_logits = outputs.logits[:, -1, :]
+
+            if DEBUG:
+                # Check what the model ACTUALLY wants to predict
+                print("********************")
+                top5 = torch.topk(next_token_logits[0], 5)
+                print("Model's top 5 predictions for first example:")
+                for val, idx in zip(top5.values, top5.indices):
+                    token_str = self.tokenizer.decode([idx.item()])
+                    print(f"  Token: '{token_str}' (ID: {idx.item()}) Score: {val.item():.3f}")
+                print(prompts[:100])
+                print(f"  'Found' score: {next_token_logits[0, self.token_map_ids['Supported']].item():.3f}")
+                print(f"  'Fake'  score: {next_token_logits[0, self.token_map_ids['Unfounded']].item():.3f}")
+
             relevant_ids = [
                 self.token_map_ids["Supported"], 
                 self.token_map_ids["Unfounded"]
@@ -339,10 +460,10 @@ class SabotageEvalCallback(TrainerCallback):
 
 
         print(f"\n[Sabotage Audit] Step {state.global_step}:")
-        print(f"  Short Context (< 1024 tok): Overall={fr_short:.2%}")
+        print(f"  Short Context (< 512 tok): Overall={fr_short:.2%}")
         print(f"    ├─ Natural Failures: {fr_short_nat:.2%} (ECE={ece_short_nat:.4f})")
         print(f"    └─ Logic Sabotage:   {fr_short_log:.2%} (ECE={ece_short_log:.4f})")
-        print(f"  Long Context (>= 1024 tok): Overall={fr_long:.2%}")
+        print(f"  Long Context (>= 512 tok): Overall={fr_long:.2%}")
         print(f"    ├─ Natural Failures: {fr_long_nat:.2%} (ECE={ece_long_nat:.4f})")
         print(f"    └─ Logic Sabotage:   {fr_long_log:.2%} (ECE={ece_long_log:.4f})")
         print(f"  By Sabotage Type:")
@@ -389,65 +510,7 @@ class SabotageEvalCallback(TrainerCallback):
                 "eval_audit/accuracy_fake": child_acc_global,
                 "global_step": state.global_step+1
                 })
-        
-        
-    def _make_prompt(self, example):
-        """Format input for inference (no completion part)."""
-        q = example['input_components']['query']
-        c_raw = example['input_components']['context']
-        c = "\n".join(c_raw) if isinstance(c_raw, list) else str(c_raw)
-        t = example['input_components']['trace']
-        s = example['output_components']['target_sentence']
-        return (
-            f"<|im_start|>system\nYou are a financial auditor.<|im_end|>\n"
-            f"<|im_start|>user\nQuery: {q}\nContext: {c}\nTrace: {t}\nStatement: {s}\n"
-            f"Task: Classify [Found, Fake, General].<|im_end|>\n"
-            f"<|im_start|>assistant\nLabel:"
-        )
 
-def format_prompt_func(example, tokenizer, max_seq_length=MAX_SEQ_LENGTH):
-    """Format with smart context truncation."""
-    output_texts = []
-    batch_size = len(example['split'])
-    
-    for i in range(batch_size):
-        raw_label = example['label'][i]
-        target_token = TOKEN_MAP.get(raw_label)
-        if not target_token:
-            continue
-        
-        q = example['input_components'][i]['query']
-        c_raw = example['input_components'][i]['context']
-        c = "\n".join(c_raw) if isinstance(c_raw, list) else str(c_raw)
-        t = example['input_components'][i]['trace']
-        s = example['output_components'][i]['target_sentence']
-        r = example['output_components'][i]['reasoning']
-        
-        # Essential parts (never truncate)
-        system_msg = "<|im_start|>system\nYou are a financial auditor.<|im_end|>\n"
-        user_prefix = f"<|im_start|>user\nQuery: {q}\n"
-        user_suffix = f"Trace: {t}\nStatement: {s}\nTask: Classify [Found, Fake, General].<|im_end|>\n<|im_start|>assistant\nLabel:"
-        completion = f"{target_token}\nAnalysis: {r}<|im_end|>"
-        
-        # Calculate budget
-        essential = system_msg + user_prefix + user_suffix + completion
-        essential_tokens = len(tokenizer.encode(essential, add_special_tokens=False))
-        context_budget = max_seq_length - essential_tokens - 20
-        
-        # Truncate context if needed
-        if context_budget > 50:
-            context_text = f"Context: {c}\n"
-            context_tokens = tokenizer.encode(context_text, add_special_tokens=False)
-            if len(context_tokens) > context_budget:
-                context_tokens = context_tokens[:context_budget]
-                context_text = tokenizer.decode(context_tokens, skip_special_tokens=True) + "\n"
-        else:
-            context_text = "Context: [Truncated]\n"
-        
-        full_text = system_msg + user_prefix + context_text + user_suffix + completion
-        output_texts.append(full_text)
-    
-    return output_texts
 
 def main():
     # Parse arguments
@@ -465,9 +528,6 @@ def main():
     
     print(f"Loading dataset pagand/venra (v2.2)...")
     dataset = load_dataset("pagand/venra", revision="v2.2")
-    
-    # Handle different split naming conventions
-    eval_split = "validation" if "validation" in dataset else "val"
     
     print(f"Initializing tokenizer: {model_args.model_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -542,13 +602,13 @@ def main():
     training_args.learning_rate = LEARNING_RATE
     
     training_args.lr_scheduler_type = "cosine"
-    training_args.warmup_ratio = 0.03
+    training_args.warmup_ratio = 0.1  #was 0.03
     training_args.logging_steps = 10 # Track learning rate
     
     training_args.evaluation_strategy = "steps"
-    training_args.eval_steps = 50 
+    training_args.eval_steps = 25 
     training_args.save_strategy = "steps"
-    training_args.save_steps = 50
+    training_args.save_steps = 25
     training_args.load_best_model_at_end = True
     
     # Model selection based on Paired Flip Rate
@@ -570,7 +630,7 @@ def main():
     os.makedirs(training_args.output_dir, exist_ok=True)
     
     print("Initializing Sabotage Evaluation Callback...")
-    sabotage_cb = SabotageEvalCallback(dataset[eval_split], tokenizer, token_map_ids)
+    sabotage_cb = SabotageEvalCallback(dataset["validation"], tokenizer, token_map_ids)
 
     callbacks=[
     sabotage_cb,
@@ -580,21 +640,48 @@ def main():
     )
     ]
     print("Initializing SFTTrainer...")
+    collator = DataCollatorForCompletionOnlyLM(
+        response_template="<|im_start|>assistant\nLabel:", 
+        tokenizer=tokenizer
+    )
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset["train"],
-        eval_dataset=dataset[eval_split],
+        eval_dataset=dataset["validation"],
         peft_config=peft_config,
         formatting_func=lambda ex: format_prompt_func(ex, tokenizer, MAX_SEQ_LENGTH),
-        data_collator=DataCollatorForCompletionOnlyLM(
-            response_template="\nLabel:", #question?!
-            tokenizer=tokenizer
-        ),
+        data_collator=collator,
         max_seq_length=MAX_SEQ_LENGTH,
         tokenizer=tokenizer,
         args=training_args,
-        callbacks=[sabotage_cb]
+        callbacks=callbacks
     )
+
+    if DEBUG:
+        sample = dataset['train'][0]
+        formatted = format_prompt_func(
+            {k: [v] for k, v in sample.items()}, 
+            tokenizer, 
+            MAX_SEQ_LENGTH
+        )[0]
+
+        tokens = tokenizer(formatted, return_tensors='pt')
+        input_ids = tokens['input_ids'][0]
+
+        # Find where "\nLabel:" appears
+        label_token_ids = tokenizer.encode("\nLabel:", add_special_tokens=False)
+        print(f"Looking for token IDs: {label_token_ids}")
+
+        # Check if collator finds it
+        batch = collator([{'input_ids': input_ids.tolist(), 
+                        'attention_mask': [1]*len(input_ids)}])
+        labels = batch['labels'][0]
+
+        # Count non-masked tokens (-100 = masked)
+        active = (labels != -100).sum().item()
+        print(f"Tokens with loss computed: {active}")
+        # If this is 0 or very small: YOUR COLLATOR IS BROKEN
+        # Should be ~115 tokens (the completion part)
 
     print("\n" + "="*80)
     print("PHASE 1 TRAINING: Baseline QLoRA + rsLoRA")

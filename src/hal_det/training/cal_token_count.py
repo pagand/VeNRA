@@ -4,6 +4,7 @@ from pathlib import Path
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from dotenv import load_dotenv
+from collections import Counter
 
 # Load environment variables (HF_TOKEN)
 load_dotenv()
@@ -69,11 +70,11 @@ def calculate_stats(file_path, tokenizer):
     if not file_path.exists():
         print(f"File {file_path} not found.")
         return None
-
+    labels = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             data = json.loads(line)
-            
+            labels.append(data['label'])
             # Extract fields
             query = data['input_components'].get('query', '')
             context = data['input_components'].get('context', [])
@@ -113,6 +114,7 @@ def calculate_stats(file_path, tokenizer):
                 # Fallback if assistant tag is missing for some reason
                 input_token_counts.append(len(tokens))
                 output_token_counts.append(0)
+        print("distribution:", Counter(labels))
 
     if not token_counts:
         return None
