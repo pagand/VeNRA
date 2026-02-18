@@ -43,27 +43,30 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF',
 # ---------------------------------------------------------------------------
 OUTPUT_DIR="./data/output"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-3B-Instruct"
-LEARNING_RATE=5e-5  #was 2e-4
-LORA_RANK=64
-LORA_ALPHA=32
+MULTIPLIER=1 #based on GPU RAM
+LEARNING_RATE=2e-4
+LORA_RANK=96 # was 64
+LORA_ALPHA=LORA_RANK # was 32
 MAX_SEQ_LENGTH=4096
 # CUDA Configuration
 CUDA_VISIBLE_DEVICES=0
 #training config
-NUM_TRAIN_EPOCHS=3
-TRAIN_BATCH_SIZE=2
-EVAL_BATCH_SIZE=3
-GRAD_ACCUM_STEP=32
+NUM_TRAIN_EPOCHS=5
+TRAIN_BATCH_SIZE=2*MULTIPLIER
+EVAL_BATCH_SIZE=3*MULTIPLIER
+GRAD_ACCUM_STEP=32//MULTIPLIER #effective 64
 EVAL_ACCUM_STEP=32
-EVAL_SABOTAGE_BATCH_SIZE=4
+EVAL_SABOTAGE_BATCH_SIZE=4*MULTIPLIER
+LR_SCHEDULER_KWARGS = {"min_lr": 1e-5}
+PENALTY=10
 RETRAIN=False
 DEBUG=False
 
 # Orthogonal Token Mapping (Spec Section 3.1)
 TOKEN_MAP = {
-    "Supported": " Found",   # ID: 1374
-    "Unfounded": " Fake",    # ID: 14757
-    "General":   " General"  # ID: 15415
+    "Supported": " Found",   # ID: 12315
+    "Unfounded": " Fake",    # ID: 36965
+    "General":   " General"  # ID: 3251
 }
 
 # Sabotage Type Categories (Spec Section 6.2)
@@ -201,6 +204,58 @@ def check_env_vars():
         if "WANDB_DIR" in os.environ:
             os.makedirs(os.getenv("WANDB_DIR"), exist_ok=True)
 
+class WeightedLabelTrainer(SFTTrainer):
+    """
+    Applies loss weight on verdict tokens using PyTorch's native
+    class weighting mechanism.
+    """
+    def __init__(self, *args, verdict_token_ids, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.verdict_token_ids = verdict_token_ids
+        vocab_size = self.model.config.vocab_size
+        self.token_weights = torch.ones(vocab_size)
+        for tid in self.verdict_token_ids:
+            if tid < vocab_size:
+                self.token_weights[tid] = PENALTY 
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        labels = inputs.get("labels")
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        logits_flat = shift_logits.view(-1, self.model.config.vocab_size)
+        labels_flat = shift_labels.view(-1)
+
+        if self.token_weights.device != logits_flat.device:
+            self.token_weights = self.token_weights.to(logits_flat.device)
+
+        chunk_size = 512
+        loss_fct = torch.nn.CrossEntropyLoss(weight=self.token_weights, reduction='sum')
+
+        total_loss = torch.tensor(0.0, device=logits_flat.device)
+        total_weight_sum = torch.tensor(0.0, device=logits_flat.device)
+
+        for i in range(0, labels_flat.shape[0], chunk_size):
+            chunk_logits = logits_flat[i:i + chunk_size]
+            chunk_labels = labels_flat[i:i + chunk_size]
+
+            valid_mask = chunk_labels != -100
+            if valid_mask.any():
+                # Compute sum of weighted losses for this chunk
+                chunk_loss = loss_fct(chunk_logits, chunk_labels)
+                total_loss += chunk_loss
+
+                # Track the denominator (sum of weights for valid tokens)
+                valid_labels = chunk_labels[valid_mask]
+                total_weight_sum += self.token_weights[valid_labels].sum()
+
+        # Final weighted mean
+        final_loss = total_loss / total_weight_sum.clamp(min=1e-9)
+        return (final_loss, outputs) if return_outputs else final_loss
+
 # --- Custom Callback: Stratified Sabotage Audit ---
 class SabotageEvalCallback(TrainerCallback):
     """
@@ -224,7 +279,7 @@ class SabotageEvalCallback(TrainerCallback):
                 if fid not in families: 
                     families[fid] = []
                 families[fid].append(row)
-            if i > 3000: 
+            if i > 5000: 
                 break # Safety limit
             
         # Build FOUR stratified pair lists (2x2 grid)
@@ -258,10 +313,10 @@ class SabotageEvalCallback(TrainerCallback):
                     self.pairs_short_natural.append(pair)
         
         # Limit size for speed (50 pairs cap per category)
-        self.pairs_short_natural = self.pairs_short_natural[:50]
-        self.pairs_short_logic = self.pairs_short_logic[:50]
-        self.pairs_long_natural = self.pairs_long_natural[:50]
-        self.pairs_long_logic = self.pairs_long_logic[:50]
+        self.pairs_short_natural = self.pairs_short_natural[:150]
+        self.pairs_short_logic = self.pairs_short_logic[:150]
+        self.pairs_long_natural = self.pairs_long_natural[:150]
+        self.pairs_long_logic = self.pairs_long_logic[:150]
         
         print(f"Sabotage Callback: Stratified Pair Counts:")
         print(f"  Short + Natural: {len(self.pairs_short_natural)}")
@@ -273,7 +328,6 @@ class SabotageEvalCallback(TrainerCallback):
         """Aggressively clear GPU cache."""
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        print(f"GPU Memory: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB allocated")
     
     def _make_prompt(self, example) -> str:
         """
@@ -470,6 +524,8 @@ class SabotageEvalCallback(TrainerCallback):
         print(f"    ├─ Natural: {fr_natural:.2%}")
         print(f"    └─ Logic:   {fr_logic:.2%}")
         print(f"  GLOBAL FLIP RATE: {fr_global:.2%}")
+        print(f"  Accuracy on FOUND samples: {parent_acc_global:.2%}")
+        print(f"  Accuracy on FAKE samples: {child_acc_global:.2%}")
 
         self.clear_gpu_memory()
         if wandb.run is not None:
@@ -602,9 +658,10 @@ def main():
     if training_args.learning_rate == 5e-5:   # HF default → user didn't set it
         training_args.learning_rate = LEARNING_RATE
     
-    training_args.lr_scheduler_type = "cosine"
+    training_args.lr_scheduler_type = "cosine_with_min_lr"
     if training_args.warmup_ratio == 0.0:     # HF default → user didn't set it
         training_args.warmup_ratio = 0.1  #was 0.03
+    training_args.lr_scheduler_kwargs =  LR_SCHEDULER_KWARGS
     training_args.logging_steps = 10 # Track learning rate
     
     training_args.evaluation_strategy = "steps"
@@ -621,7 +678,7 @@ def main():
     training_args.report_to = ["wandb"]
     if not training_args.run_name:
         training_args.run_name = (
-            f"venra-v3-r{model_args.lora_rank}"
+            f"venra-weighted-p{PENALTY}-r{model_args.lora_rank}-a{model_args.lora_rank}"
             f"-lr{training_args.learning_rate}"
             f"-w{training_args.warmup_ratio}"
         )    
@@ -642,8 +699,8 @@ def main():
     callbacks=[
     sabotage_cb,
     EarlyStoppingCallback(
-        early_stopping_patience=3,  # Stop if no improvement for 3 evals
-        early_stopping_threshold=0.01  # Min improvement = 1%
+        early_stopping_patience=10,  # Stop if no improvement for 10 evals
+        early_stopping_threshold=0.005  # Min improvement = 0.5%
     )
     ]
     print("Initializing SFTTrainer...")
@@ -651,7 +708,7 @@ def main():
         response_template="<|im_start|>assistant\nLabel:", 
         tokenizer=tokenizer
     )
-    trainer = SFTTrainer(
+    trainer = WeightedLabelTrainer(
         model=model,
         train_dataset=dataset["train"],
         eval_dataset=dataset["validation"],
@@ -661,7 +718,8 @@ def main():
         max_seq_length=MAX_SEQ_LENGTH,
         tokenizer=tokenizer,
         args=training_args,
-        callbacks=callbacks
+        callbacks=callbacks,
+        verdict_token_ids=list(token_map_ids.values())  # [12315, 36965, 3251]
     )
 
     if DEBUG:
@@ -732,6 +790,9 @@ def main():
     
     # Save tokenizer
     tokenizer.save_pretrained(training_args.output_dir)
+
+    print(model_args) 
+    print(training_args)
     
     print(f"\n✅ Model saved to: {training_args.output_dir}")
     print("\nPHASE 2 CONTINGENCIES (Only if Phase 1 fails targets):")
