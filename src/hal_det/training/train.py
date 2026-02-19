@@ -731,7 +731,7 @@ def main():
     training_args.load_best_model_at_end = True
     
     # Model selection based on Paired Flip Rate
-    training_args.metric_for_best_model = "eval_audit/flip_rate_global"
+    training_args.metric_for_best_model = "eval_audit/composite_score"
     training_args.greater_is_better = True
     
     training_args.optim = "paged_adamw_8bit"
