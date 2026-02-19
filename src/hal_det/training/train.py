@@ -12,10 +12,11 @@ DEFERRED TO PHASE 2:
 
 import os
 import sys
+import random
 import torch
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple, Any
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
@@ -23,13 +24,13 @@ from transformers import (
     TrainingArguments,
     BitsAndBytesConfig,
     HfArgumentParser,
-    TrainerCallback
+    TrainerCallback,
+    EarlyStoppingCallback
 )
 from peft import LoraConfig, prepare_model_for_kbit_training, TaskType
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import wandb
 from dotenv import load_dotenv
-from transformers import EarlyStoppingCallback
 
 
 load_dotenv()
@@ -57,11 +58,14 @@ EVAL_BATCH_SIZE=3*MULTIPLIER
 GRAD_ACCUM_STEP=32//MULTIPLIER #effective 64
 EVAL_ACCUM_STEP=32
 EVAL_SABOTAGE_BATCH_SIZE=4*MULTIPLIER
-LR_SCHEDULER_KWARGS = {"min_lr": 1e-5}
-PENALTY=10
+LR_SCHEDULER_KWARGS = {"min_lr": 5e-2*LEARNING_RATE}
+PENALTY=50
+PATIENCE=10
+WARMUP_RATIO=0.1
+EVAL_STEPS=25 #eval and save freq
+MAX_GRAD_NORM=0.3
 RETRAIN=False
 DEBUG=False
-
 # Orthogonal Token Mapping (Spec Section 3.1)
 TOKEN_MAP = {
     "Supported": " Found",   # ID: 12315
@@ -206,17 +210,25 @@ def check_env_vars():
 
 class WeightedLabelTrainer(SFTTrainer):
     """
-    Applies loss weight on verdict tokens using PyTorch's native
-    class weighting mechanism.
+    Robust Weighted Trainer with Gradient Safety Valve.
+    
+    Features:
+    1. Configurable penalty on verdict tokens.
+    2. Parameterized loss ceiling to prevent gradient explosions.
+    3. Micro-chunking for OOM safety on large vocabs.
     """
-    def __init__(self, *args, verdict_token_ids, **kwargs):
+    def __init__(self, *args, verdict_token_ids, penalty=50.0, loss_ceiling=None, chunk_size=512, **kwargs):
         super().__init__(*args, **kwargs)
         self.verdict_token_ids = verdict_token_ids
+        self.penalty = penalty
+        self.loss_ceiling = loss_ceiling if loss_ceiling is not None else 5.0 * penalty
+        self.chunk_size = chunk_size
+
         vocab_size = self.model.config.vocab_size
         self.token_weights = torch.ones(vocab_size)
         for tid in self.verdict_token_ids:
             if tid < vocab_size:
-                self.token_weights[tid] = PENALTY 
+                self.token_weights[tid] = self.penalty
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
@@ -232,341 +244,382 @@ class WeightedLabelTrainer(SFTTrainer):
         if self.token_weights.device != logits_flat.device:
             self.token_weights = self.token_weights.to(logits_flat.device)
 
-        chunk_size = 512
-        loss_fct = torch.nn.CrossEntropyLoss(weight=self.token_weights, reduction='sum')
-
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
         total_loss = torch.tensor(0.0, device=logits_flat.device)
         total_weight_sum = torch.tensor(0.0, device=logits_flat.device)
 
-        for i in range(0, labels_flat.shape[0], chunk_size):
-            chunk_logits = logits_flat[i:i + chunk_size]
-            chunk_labels = labels_flat[i:i + chunk_size]
-
+        for i in range(0, labels_flat.shape[0], self.chunk_size):
+            chunk_logits = logits_flat[i:i + self.chunk_size]
+            chunk_labels = labels_flat[i:i + self.chunk_size]
             valid_mask = chunk_labels != -100
+
             if valid_mask.any():
-                # Compute sum of weighted losses for this chunk
-                chunk_loss = loss_fct(chunk_logits, chunk_labels)
-                total_loss += chunk_loss
+                raw_token_losses = loss_fct(chunk_logits, chunk_labels)
 
-                # Track the denominator (sum of weights for valid tokens)
-                valid_labels = chunk_labels[valid_mask]
-                total_weight_sum += self.token_weights[valid_labels].sum()
+                # Safe indexing: replace -100 with 0 before weight lookup
+                safe_labels = chunk_labels.clone()
+                safe_labels[~valid_mask] = 0
+                chunk_weights = self.token_weights[safe_labels]
 
-        # Final weighted mean
+                weighted_losses = raw_token_losses * chunk_weights
+
+                # Safety valve: ceiling is tied to penalty, not hardcoded
+                weighted_losses = torch.clamp(weighted_losses, max=self.loss_ceiling)
+
+                total_loss += weighted_losses[valid_mask].sum()
+                total_weight_sum += chunk_weights[valid_mask].sum()
+
         final_loss = total_loss / total_weight_sum.clamp(min=1e-9)
         return (final_loss, outputs) if return_outputs else final_loss
 
-# --- Custom Callback: Stratified Sabotage Audit ---
 class SabotageEvalCallback(TrainerCallback):
     """
-    Principal Scientist Tool (Spec Section 6.2):
-    Calculates Paired Flip Rate, stratified by:
-    1. Context Length (Short < 1024 tokens, Long >= 1024 tokens)
-    2. Sabotage Type (Logic Sabotage vs Natural Failures)
+    Audit Tool (v4.0).
+
+    Stratified evaluation covering:
+      1. Paired Flip Rate — stratified by Short / Long context
+      2. Natural Failure Recall — orphaned Unfounded rows (real hallucinations)
+      3. False Positive Rate — orphaned Supported rows (false alarms)
+      4. Axiom Accuracy — General-labelled rows (knowledge retention)
+
+    All subsets are fixed at init time (reproducible seed) so every eval
+    checkpoint is comparable.
     """
-    def __init__(self, eval_dataset, tokenizer, token_map_ids):
-        self.tokenizer = tokenizer
-        self.token_map_ids = token_map_ids
-        
-        print("Initializing Sabotage Callback (Building Paired Test Sets)...")
-        
+
+    def __init__(
+        self,
+        eval_dataset,
+        tokenizer,
+        token_map_ids,
+        # ── Budget hyper-params ──────────────────────────────────────────────
+        max_pairs_per_stratum: int = 100,   # 100 short + 100 long = 200 pair prompts
+        max_natural_fake: int = 80,        # natural Unfounded orphans
+        max_natural_true: int = 80,        # orphaned Supported
+        max_axioms: int = 20,              # General rows
+        eval_batch_size: int = EVAL_SABOTAGE_BATCH_SIZE, # batch size
+        length_threshold: int = 512,       # token boundary for short vs long
+        seed: int = 42,
+    ):
+        self.tokenizer       = tokenizer
+        self.token_map_ids   = token_map_ids
+        self.eval_batch_size = eval_batch_size
+        self.length_threshold = length_threshold
+
+        print("Initializing Comprehensive Audit Set (v4.0)...")
+
+        rng = random.Random(seed)          # local — does NOT touch global state
+
+        # ── Step 1: Build family dict (all rows have a family_id) ────────────
         families: Dict[str, list] = {}
         for i, row in enumerate(eval_dataset):
-            # Safe access to metadata
-            meta = row.get('meta', {})
-            fid = meta.get('family_id')
+            fid = row.get("meta", {}).get("family_id")
             if fid:
-                if fid not in families: 
-                    families[fid] = []
-                families[fid].append(row)
-            if i > 5000: 
-                break # Safety limit
-            
-        # Build FOUR stratified pair lists (2x2 grid)
-        self.pairs_short_natural = []
-        self.pairs_short_logic = []
-        self.pairs_long_natural = []
-        self.pairs_long_logic = []
-        
-        for fid, members in families.items():
-            parent = next((m for m in members if m['label'] == 'Supported'), None)
-            child = next((m for m in members if m['label'] == 'Unfounded'), None)
-            
-            if parent and child:
-                # Extract metadata
-                t_count = parent.get('meta', {}).get('token_count', 0)
-                sabotage_type = child.get('sabotage_type', 'unknown')
-                
+                families.setdefault(fid, []).append(row)
+            if i >= 5000:
+                break
+
+        # ── Step 2: Route into pools ─────────────────────────────────────────
+        #
+        # Family shapes:
+        #   2-member (Supported + Unfounded)  → candidate pair
+        #   1-member Supported                → orphaned Supported (natural_true pool)
+        #   1-member Unfounded, natural       → natural_fake pool
+        #   any member with label=General     → axiom pool
+        #
+        # sabotage_type is a TOP-LEVEL field, NOT inside meta.
+
+        pairs_short:       List[Tuple[Any, Any]] = []
+        pairs_long:        List[Tuple[Any, Any]] = []
+        natural_fake_pool: List[Any]             = []
+        natural_true_pool: List[Any]             = []
+        axiom_pool:        List[Any]             = []
+
+        for fid, members in sorted(families.items()):
+            # Separate by label
+            supported = [m for m in members if m["label"] == "Supported"]
+            unfounded = [m for m in members if m["label"] == "Unfounded"]
+            general   = [m for m in members if m["label"] == "General"]
+
+            # General members always go to axiom pool (may co-exist with others)
+            axiom_pool.extend(general)
+
+            if supported and unfounded:
+                # Valid pair — use first of each (families should be 1+1)
+                parent = supported[0]
+                child  = unfounded[0]
+                t_count = parent.get("meta", {}).get("token_count", 0)
                 pair = (parent, child)
-                
-                # Stratify by BOTH dimensions
-                is_long = t_count >= 512
-                is_logic = sabotage_type in LOGIC_SABOTAGE_TYPES
-                
-                if is_long and is_logic:
-                    self.pairs_long_logic.append(pair)
-                elif is_long and not is_logic:
-                    self.pairs_long_natural.append(pair)
-                elif not is_long and is_logic:
-                    self.pairs_short_logic.append(pair)
-                else:  # short + natural
-                    self.pairs_short_natural.append(pair)
-        
-        # Limit size for speed (50 pairs cap per category)
-        self.pairs_short_natural = self.pairs_short_natural[:150]
-        self.pairs_short_logic = self.pairs_short_logic[:150]
-        self.pairs_long_natural = self.pairs_long_natural[:150]
-        self.pairs_long_logic = self.pairs_long_logic[:150]
-        
-        print(f"Sabotage Callback: Stratified Pair Counts:")
-        print(f"  Short + Natural: {len(self.pairs_short_natural)}")
-        print(f"  Short + Logic:   {len(self.pairs_short_logic)}")
-        print(f"  Long + Natural:  {len(self.pairs_long_natural)}")
-        print(f"  Long + Logic:    {len(self.pairs_long_logic)}")
+                if t_count >= length_threshold:
+                    pairs_long.append(pair)
+                else:
+                    pairs_short.append(pair)
+
+            else:
+                # Orphaned members
+                for m in supported:
+                    natural_true_pool.append(m)
+                for m in unfounded:
+                    # Only natural Unfounded orphans — top-level sabotage_type field
+                    if m.get("sabotage_type", "unknown") == "natural":
+                        natural_fake_pool.append(m)
+
+        # ── Step 3: Fixed random subsets ─────────────────────────────────────
+        rng.shuffle(pairs_short)
+        rng.shuffle(pairs_long)
+        rng.shuffle(natural_fake_pool)
+        rng.shuffle(natural_true_pool)
+        rng.shuffle(axiom_pool)
+
+        self.pairs_short    = pairs_short[:max_pairs_per_stratum]
+        self.pairs_long     = pairs_long[:max_pairs_per_stratum]
+        nat_fake_subset     = natural_fake_pool[:max_natural_fake]
+        nat_true_subset     = natural_true_pool[:max_natural_true]
+        axiom_subset        = axiom_pool[:max_axioms]
+
+        # ── Step 4: Flat eval batch (layout fixed, sliceable by meta tag) ────
+        #
+        # Order: [pairs_short | pairs_long | natural_fake | natural_true | axioms]
+        # Child always immediately follows parent → index+1 arithmetic is safe.
+
+        self.eval_examples: List[Any] = []
+        self.ground_truth:  List[int] = []   # 0=Found/Supported, 1=Fake/Unfounded, 2=General
+        self.meta_labels:   List[str] = []   # for mask-based slicing
+
+        for p, c in self.pairs_short:
+            self.eval_examples.extend([p, c])
+            self.ground_truth.extend([0, 1])
+            self.meta_labels.extend(["pair_short_parent", "pair_short_child"])
+
+        for p, c in self.pairs_long:
+            self.eval_examples.extend([p, c])
+            self.ground_truth.extend([0, 1])
+            self.meta_labels.extend(["pair_long_parent", "pair_long_child"])
+
+        for row in nat_fake_subset:
+            self.eval_examples.append(row)
+            self.ground_truth.append(1)
+            self.meta_labels.append("natural_fake")
+
+        for row in nat_true_subset:
+            self.eval_examples.append(row)
+            self.ground_truth.append(0)
+            self.meta_labels.append("natural_true")
+
+        for row in axiom_subset:
+            self.eval_examples.append(row)
+            self.ground_truth.append(2)
+            self.meta_labels.append("axiom")
+
+        total_calls = len(self.eval_examples)
+        print(f"  Pairs (Short  < {length_threshold} tok): {len(self.pairs_short)} pairs → {len(self.pairs_short)*2} prompts")
+        print(f"  Pairs (Long  >= {length_threshold} tok): {len(self.pairs_long)} pairs → {len(self.pairs_long)*2} prompts")
+        print(f"  Natural Fake (orphaned Unfounded):        {len(nat_fake_subset)} prompts")
+        print(f"  Natural True (orphaned Supported):        {len(nat_true_subset)} prompts")
+        print(f"  Axioms (General):                         {len(axiom_subset)} prompts")
+        print(f"  ─────────────────────────────────────────")
+        # Pre-build prompts once — the set is fixed for the whole training run
+        print("  Pre-building prompts...")
+        self.prompts = [self._make_prompt(x) for x in self.eval_examples]
+
+        # Convert to numpy for fast boolean indexing
+        self.meta_np  = np.array(self.meta_labels)
+        self.truth_np = np.array(self.ground_truth)
+        print("  Done. Audit set is ready.\n")
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
 
     def clear_gpu_memory(self):
-        """Aggressively clear GPU cache."""
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    
+
     def _make_prompt(self, example) -> str:
-        """
-        Inference-mode prompt.
-        Calls build_prompt with label_token=None so the sequence ends at 'Label:'
-        and uses the SAME truncation logic as training.
-        """
-        c_raw = example['input_components']['context']
+        """Inference-mode prompt — ends at 'Label:' with no completion."""
+        c_raw = example["input_components"]["context"]
         return build_prompt(
-            query     = example['input_components']['query'],
-            context   = "\n".join(c_raw) if isinstance(c_raw, list) else str(c_raw),
-            trace     = example['input_components']['trace'],
-            statement = example['output_components']['target_sentence'],
-            tokenizer = self.tokenizer,
+            query          = example["input_components"]["query"],
+            context        = "\n".join(c_raw) if isinstance(c_raw, list) else str(c_raw),
+            trace          = example["input_components"]["trace"],
+            statement      = example["output_components"]["target_sentence"],
+            tokenizer      = self.tokenizer,
             max_seq_length = MAX_SEQ_LENGTH,
-            label_token = None,   # ← inference mode: no completion
-            reasoning   = None,
+            label_token    = None,
+            reasoning      = None,
         )
 
-    def on_evaluate(self, args, state, control, model, metrics=None, **kwargs):
-        model.eval()        
-        # Helper to run eval on a specific list of pairs
-        def evaluate_subset(pairs):
-            if not pairs: 
-                return 0.0, 0.0, 0.0, 0.0
-            
-            prompts = []
-            ece_labels = []
-            for parent, child in pairs:
-                prompts.append(self._make_prompt(parent))
-                ece_labels.append(0) # Found (Supported)
-                prompts.append(self._make_prompt(child))
-                ece_labels.append(1) # Fake (Unfounded)
-            
+    # ── Inference (batched, OOM-safe) ─────────────────────────────────────────
+
+    def _run_batched_inference(self, model) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Runs the full eval_batch in mini-batches of self.eval_batch_size.
+        Returns (preds, confs) arrays of shape [N] where preds ∈ {0, 1, 2}.
+
+        Mirrors the original evaluate_subset_batched pattern.
+        """
+        relevant_ids = [
+            self.token_map_ids["Supported"],   # → pred index 0
+            self.token_map_ids["Unfounded"],   # → pred index 1
+            self.token_map_ids["General"],     # → pred index 2
+        ]
+
+        all_preds: List[int]   = []
+        all_confs: List[float] = []
+
+        for batch_start in range(0, len(self.prompts), self.eval_batch_size):
+            batch_end     = min(batch_start + self.eval_batch_size, len(self.prompts))
+            batch_prompts = self.prompts[batch_start:batch_end]
+
             inputs = self.tokenizer(
-                prompts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, # handled by make_prompt
-                max_length=MAX_SEQ_LENGTH
+                batch_prompts,
+                return_tensors = "pt",
+                padding        = True,
+                truncation     = True,
+                max_length     = MAX_SEQ_LENGTH,
             ).to(model.device)
-            
+
             with torch.no_grad():
                 outputs = model(**inputs)
-            
+
+            # Next-token logits → 3-class distribution
             next_token_logits = outputs.logits[:, -1, :]
+            relevant_logits   = next_token_logits[:, relevant_ids]
+            probs             = torch.softmax(relevant_logits, dim=-1)
+            preds             = torch.argmax(probs, dim=-1).cpu().numpy()
+            confs             = torch.max(probs, dim=-1).values.cpu().numpy()
 
-            if DEBUG:
-                # Check what the model ACTUALLY wants to predict
-                print("********************")
-                top5 = torch.topk(next_token_logits[0], 5)
-                print("Model's top 5 predictions for first example:")
-                for val, idx in zip(top5.values, top5.indices):
-                    token_str = self.tokenizer.decode([idx.item()])
-                    print(f"  Token: '{token_str}' (ID: {idx.item()}) Score: {val.item():.3f}")
-                print(prompts[:100])
-                print(f"  'Found' score: {next_token_logits[0, self.token_map_ids['Supported']].item():.3f}")
-                print(f"  'Fake'  score: {next_token_logits[0, self.token_map_ids['Unfounded']].item():.3f}")
+            all_preds.extend(preds.tolist())
+            all_confs.extend(confs.tolist())
 
-            relevant_ids = [
-                self.token_map_ids["Supported"], 
-                self.token_map_ids["Unfounded"]
-            ]
-            probs = torch.softmax(next_token_logits[:, relevant_ids], dim=-1)
-            predictions = torch.argmax(probs, dim=-1).cpu().numpy()
-            confidences = torch.max(probs, dim=-1).values.cpu().numpy()
-            
-            # Flip Rate (Paired Sensitivity)
-            correct_flips = 0
-            for i in range(len(pairs)):
-                parent_correct = predictions[i*2] == 0
-                child_correct = predictions[i*2 + 1] == 1
-                if parent_correct and child_correct:
-                    correct_flips += 1
-            flip_rate = correct_flips / len(pairs) if len(pairs) > 0 else 0.0
-            
-            # ECE (Expected Calibration Error)
-            accuracies = (predictions == np.array(ece_labels)).astype(float)
-            ece = np.abs(confidences - accuracies).mean()
-            # Track per-label accuracy
-            parent_acc = (predictions[::2] == 0).mean()  # "Found" accuracy
-            child_acc = (predictions[1::2] == 1).mean()  # "Fake" accuracy
-            del inputs, outputs, next_token_logits, probs
-            return flip_rate, ece, parent_acc, child_acc
+            # Explicit cleanup — mirrors original clear pattern
+            del inputs, outputs, next_token_logits, relevant_logits, probs
 
-        def evaluate_subset_batched(pairs, batch_size=EVAL_SABOTAGE_BATCH_SIZE):
-            """Process pairs in mini-batches if list is too large."""
-            self.clear_gpu_memory()
-            if len(pairs) <= batch_size:
-                # Small enough - process all at once
-                return evaluate_subset(pairs)
-            
-            # Too large - split into batches
-            all_flip_rates = []
-            all_eces = []
-            all_parent_accs = [] 
-            all_child_accs = []   
-            all_pair_counts = []
-            
-            for batch_start in range(0, len(pairs), batch_size):
-                batch_end = min(batch_start + batch_size, len(pairs))
-                batch_pairs = pairs[batch_start:batch_end]
-                
-                fr, ece, parent_acc, child_acc = evaluate_subset(batch_pairs)  # FIX: Unpack 4 values
-                
-                all_flip_rates.append(fr)
-                all_eces.append(ece)
-                all_parent_accs.append(parent_acc)
-                all_child_accs.append(child_acc)
-                all_pair_counts.append(len(batch_pairs))
-            
-            # Weighted average across batches
-            total_pairs = sum(all_pair_counts)
-            avg_flip_rate = sum(fr * count for fr, count in zip(all_flip_rates, all_pair_counts)) / total_pairs
-            avg_ece = sum(ece * count for ece, count in zip(all_eces, all_pair_counts)) / total_pairs
-            avg_parent_acc = sum(pa * count for pa, count in zip(all_parent_accs, all_pair_counts)) / total_pairs  # NEW
-            avg_child_acc = sum(ca * count for ca, count in zip(all_child_accs, all_pair_counts)) / total_pairs    # NEW
-            
-            return avg_flip_rate, avg_ece, avg_parent_acc, avg_child_acc
+        return np.array(all_preds), np.array(all_confs)
 
-        # Run Stratified Audit (2x2 grid)
-        fr_short_nat, ece_short_nat, pa_short_nat, ca_short_nat = evaluate_subset_batched(self.pairs_short_natural)
-        fr_short_log, ece_short_log, pa_short_log, ca_short_log = evaluate_subset_batched(self.pairs_short_logic)
-        fr_long_nat, ece_long_nat, pa_long_nat, ca_long_nat = evaluate_subset_batched(self.pairs_long_natural)
-        fr_long_log, ece_long_log, pa_long_log, ca_long_log = evaluate_subset_batched(self.pairs_long_logic)
+    # ── Main callback ─────────────────────────────────────────────────────────
 
-        # Marginal Aggregates
-        total_short = len(self.pairs_short_natural) + len(self.pairs_short_logic)
-        total_long = len(self.pairs_long_natural) + len(self.pairs_long_logic)
-        total_natural = len(self.pairs_short_natural) + len(self.pairs_long_natural)
-        total_logic = len(self.pairs_short_logic) + len(self.pairs_long_logic)
-        total_all = total_short + total_long
-        
-        # Weighted averages for marginals
-        if total_short > 0:
-            fr_short = (fr_short_nat * len(self.pairs_short_natural) + 
-                       fr_short_log * len(self.pairs_short_logic)) / total_short
-        else:
-            fr_short = 0.0
-            
-        if total_long > 0:
-            fr_long = (fr_long_nat * len(self.pairs_long_natural) + 
-                      fr_long_log * len(self.pairs_long_logic)) / total_long
-        else:
-            fr_long = 0.0
-            
-        if total_natural > 0:
-            fr_natural = (fr_short_nat * len(self.pairs_short_natural) + 
-                         fr_long_nat * len(self.pairs_long_natural)) / total_natural
-        else:
-            fr_natural = 0.0
-            
-        if total_logic > 0:
-            fr_logic = (fr_short_log * len(self.pairs_short_logic) + 
-                       fr_long_log * len(self.pairs_long_logic)) / total_logic
-        else:
-            fr_logic = 0.0
+    def on_evaluate(self, args, state, control, model, metrics=None, **kwargs):
+        model.eval()
+        self.clear_gpu_memory()
 
-        # Calculate global accuracies (weighted average)
-        total_all = total_short + total_long
-        if total_all > 0:
-            parent_acc_global = (
-                pa_short_nat * len(self.pairs_short_natural) +
-                pa_short_log * len(self.pairs_short_logic) +
-                pa_long_nat * len(self.pairs_long_natural) +
-                pa_long_log * len(self.pairs_long_logic)
-            ) / total_all
-            
-            child_acc_global = (
-                ca_short_nat * len(self.pairs_short_natural) +
-                ca_short_log * len(self.pairs_short_logic) +
-                ca_long_nat * len(self.pairs_long_natural) +
-                ca_long_log * len(self.pairs_long_logic)
-            ) / total_all
-        else:
-            parent_acc_global = 0.0
-            child_acc_global = 0.0
-        
-        # Global metric (for model selection)
-        if total_all > 0:
-            fr_global = (fr_short * total_short + fr_long * total_long) / total_all
-        else:
-            fr_global = 0.0
+        preds_np, confs_np = self._run_batched_inference(model)
 
+        # ── Helper: paired metrics for one stratum ────────────────────────────
+        def compute_pair_metrics(parent_tag: str):
+            """
+            Returns (flip_rate, ece, parent_acc, child_acc, n_pairs).
+            Child tag is inferred by replacing 'parent' → 'child'.
+            """
+            child_tag  = parent_tag.replace("parent", "child")
+            parent_idx = np.where(self.meta_np == parent_tag)[0]
+            child_idx  = np.where(self.meta_np == child_tag)[0]
+            n = len(parent_idx)
+            if n == 0:
+                return 0.0, 0.0, 0.0, 0.0, 0
 
-        print(f"\n[Sabotage Audit] Step {state.global_step}:")
-        print(f"  Short Context (< 512 tok): Overall={fr_short:.2%}")
-        print(f"    ├─ Natural Failures: {fr_short_nat:.2%} (ECE={ece_short_nat:.4f})")
-        print(f"    └─ Logic Sabotage:   {fr_short_log:.2%} (ECE={ece_short_log:.4f})")
-        print(f"  Long Context (>= 512 tok): Overall={fr_long:.2%}")
-        print(f"    ├─ Natural Failures: {fr_long_nat:.2%} (ECE={ece_long_nat:.4f})")
-        print(f"    └─ Logic Sabotage:   {fr_long_log:.2%} (ECE={ece_long_log:.4f})")
-        print(f"  By Sabotage Type:")
-        print(f"    ├─ Natural: {fr_natural:.2%}")
-        print(f"    └─ Logic:   {fr_logic:.2%}")
-        print(f"  GLOBAL FLIP RATE: {fr_global:.2%}")
-        print(f"  Accuracy on FOUND samples: {parent_acc_global:.2%}")
-        print(f"  Accuracy on FAKE samples: {child_acc_global:.2%}")
+            # Flip Rate (KEPT from original): both must be correct simultaneously
+            correct_flips = int(np.sum(
+                (preds_np[parent_idx] == 0) & (preds_np[child_idx] == 1)
+            ))
+            flip_rate  = correct_flips / n
+            parent_acc = float(np.mean(preds_np[parent_idx] == 0))
+            child_acc  = float(np.mean(preds_np[child_idx]  == 1))
+
+            # ECE (KEPT from original): computed on the binary Found/Fake slice
+            all_idx = np.concatenate([parent_idx, child_idx])
+            truths  = np.concatenate([np.zeros(n, dtype=int), np.ones(n, dtype=int)])
+            accs    = (preds_np[all_idx] == truths).astype(float)
+            ece     = float(np.abs(confs_np[all_idx] - accs).mean())
+
+            return flip_rate, ece, parent_acc, child_acc, n
+
+        # ── Metric A: Paired Flip Rate — Short + Long (KEPT) ─────────────────
+        fr_short, ece_short, pa_short, ca_short, n_short = compute_pair_metrics("pair_short_parent")
+        fr_long,  ece_long,  pa_long,  ca_long,  n_long  = compute_pair_metrics("pair_long_parent")
+
+        total_pairs = n_short + n_long
+        def weighted(a, na, b, nb):
+            denom = na + nb
+            return (a * na + b * nb) / denom if denom > 0 else 0.0
+
+        fr_global  = weighted(fr_short, n_short, fr_long, n_long)
+        pa_global  = weighted(pa_short, n_short, pa_long, n_long)
+        ca_global  = weighted(ca_short, n_short, ca_long, n_long)
+        ece_global = weighted(ece_short, n_short, ece_long, n_long)
+
+        # ── Metric B: Recall on Natural Fake orphans (ADDED) ─────────────────
+        nat_fake_mask   = (self.meta_np == "natural_fake")
+        n_nat_fake      = nat_fake_mask.sum()
+        recall_nat_fake = float(np.mean(preds_np[nat_fake_mask] == 1)) if n_nat_fake > 0 else 0.0
+
+        # ── Metric C: FPR / TPR on Natural True orphans (ADDED) ──────────────
+        nat_true_mask = (self.meta_np == "natural_true")
+        n_nat_true    = nat_true_mask.sum()
+        fpr_nat_true  = float(np.mean(preds_np[nat_true_mask] == 1)) if n_nat_true > 0 else 0.0
+        tpr_nat_true  = float(np.mean(preds_np[nat_true_mask] == 0)) if n_nat_true > 0 else 0.0
+
+        # ── Metric D: Axiom Accuracy (ADDED) ─────────────────────────────────
+        axiom_mask = (self.meta_np == "axiom")
+        n_axioms   = axiom_mask.sum()
+        acc_axiom  = float(np.mean(preds_np[axiom_mask] == 2)) if n_axioms > 0 else 0.0
+
+        # ── Composite Score (ADDED, normalized [0,1]) ─────────────────────────
+        # Multiplication across four capability pillars.
+        # Penalizes FPR directly: high FPR → lower tpr_nat_true → lower score.
+        composite = fr_global * recall_nat_fake * tpr_nat_true * acc_axiom
+
+        # ── Print ─────────────────────────────────────────────────────────────
+        print(f"\n[Comprehensive Audit] Step {state.global_step}")
+        print(f"  ── Paired Flip Rate ─────────────────────────────────────────")
+        print(f"    Short (<  {self.length_threshold} tok): {fr_short:.2%}  "
+              f"(ECE={ece_short:.4f}, Found={pa_short:.2%}, Fake={ca_short:.2%}, n={n_short})")
+        print(f"    Long  (>= {self.length_threshold} tok): {fr_long:.2%}  "
+              f"(ECE={ece_long:.4f}, Found={pa_long:.2%}, Fake={ca_long:.2%}, n={n_long})")
+        print(f"    GLOBAL: {fr_global:.2%}  "
+              f"(ECE={ece_global:.4f}, Found acc={pa_global:.2%}, Fake acc={ca_global:.2%})")
+        print(f"  ── Natural Distribution ({n_nat_fake} fake / {n_nat_true} true) ──────────")
+        print(f"    Recall   (Nat Fake / real hallucinations): {recall_nat_fake:.2%}  ↑ higher is better")
+        print(f"    TPR      (Nat True / valid docs correct):  {tpr_nat_true:.2%}  ↑ higher is better")
+        print(f"    FPR      (Nat True / false alarms):        {fpr_nat_true:.2%}  ↓ lower is better")
+        print(f"  ── General Knowledge (n={n_axioms}) ──────────────────────────────")
+        print(f"    Axiom Accuracy: {acc_axiom:.2%}")
+        print(f"  ── Composite Score: {composite:.4f}  (range [0, 1]) ─────────────")
 
         self.clear_gpu_memory()
-        if wandb.run is not None:
-            wandb.log({
-                    "eval_audit/flip_rate_global": fr_global,
-                    "eval_audit/flip_rate_short": fr_short,
-                    "eval_audit/flip_rate_long": fr_long,
-                    "eval_audit/flip_rate_natural": fr_natural,
-                    "eval_audit/flip_rate_logic": fr_logic,
-                    "eval_audit/flip_rate_short_natural": fr_short_nat,
-                    "eval_audit/flip_rate_short_logic": fr_short_log,
-                    "eval_audit/flip_rate_long_natural": fr_long_nat,
-                    "eval_audit/flip_rate_long_logic": fr_long_log,
-                    "eval_audit/ece_short_natural": ece_short_nat,
-                    "eval_audit/ece_short_logic": ece_short_log,
-                    "eval_audit/ece_long_natural": ece_long_nat,
-                    "eval_audit/ece_long_logic": ece_long_log,
-                    "eval_audit/accuracy_found": parent_acc_global,
-                    "eval_audit/accuracy_fake": child_acc_global,
-                }, step=state.global_step+1)
-            print(f"✓ Logged metrics to wandb at step {state.global_step+1}")
-        if metrics is not None:
-            metrics.update( {
-                "eval_audit/flip_rate_global": fr_global,
-                "eval_audit/flip_rate_short": fr_short,
-                "eval_audit/flip_rate_long": fr_long,
-                "eval_audit/flip_rate_natural": fr_natural,
-                "eval_audit/flip_rate_logic": fr_logic,
-                "eval_audit/flip_rate_short_natural": fr_short_nat,
-                "eval_audit/flip_rate_short_logic": fr_short_log,
-                "eval_audit/flip_rate_long_natural": fr_long_nat,
-                "eval_audit/flip_rate_long_logic": fr_long_log,
-                "eval_audit/ece_short_natural": ece_short_nat,
-                "eval_audit/ece_short_logic": ece_short_log,
-                "eval_audit/ece_long_natural": ece_long_nat,
-                "eval_audit/ece_long_logic": ece_long_log,
-                "eval_audit/accuracy_found": parent_acc_global,
-                "eval_audit/accuracy_fake": child_acc_global,
-                "global_step": state.global_step+1
-                })
 
+        # ── Build log dict ────────────────────────────────────────────────────
+        log_dict = {
+            # ── KEPT from old code ──
+            "eval_audit/flip_rate_global":    fr_global,
+            "eval_audit/flip_rate_short":     fr_short,
+            "eval_audit/flip_rate_long":      fr_long,
+            "eval_audit/ece_global":          ece_global,
+            "eval_audit/ece_short":           ece_short,
+            "eval_audit/ece_long":            ece_long,
+            "eval_audit/accuracy_found":      pa_global,    # was parent_acc_global
+            "eval_audit/accuracy_fake":       ca_global,    # was child_acc_global
+            # ── ADDED ──
+            "eval_audit/recall_natural_fake": recall_nat_fake,
+            "eval_audit/fpr_natural_true":    fpr_nat_true,
+            "eval_audit/tpr_natural_true":    tpr_nat_true,
+            "eval_audit/axiom_accuracy":      acc_axiom,
+            "eval_audit/composite_score":     composite,
+        }
+
+        if wandb.run is not None:
+            # Metric E: Confusion Matrix (WandB Native Plot)
+            class_names = ["Found", "Fake", "General"]
+            confusion_matrix = {
+                "eval_audit/conf_mat": wandb.plot.confusion_matrix(
+                    probs=None,
+                    y_true=self.truth_np,
+                    preds=preds_np,
+                    class_names=class_names
+                )}
+            wandb.log(log_dict|confusion_matrix, step=state.global_step + 1)
+            print(f"✓ Logged {len(log_dict)} metrics to wandb at step {state.global_step + 1}")
+
+        if metrics is not None:
+            metrics.update(log_dict)
+            metrics["global_step"] = state.global_step + 1
 
 def main():
     # Parse arguments
@@ -644,6 +697,13 @@ def main():
         ]
     )
 
+    if not training_args.run_name:
+        training_args.run_name = (
+            f"venra-weighted-p{PENALTY}-r{model_args.lora_rank}-a{model_args.lora_rank}"
+            f"-lr{training_args.learning_rate}"
+            f"-w{training_args.warmup_ratio}"
+        )
+
     # Set default training arguments if not provided
     if training_args.output_dir in ("tmp", None):  # Default value from TrainingArguments
         training_args.output_dir = OUTPUT_DIR
@@ -660,14 +720,14 @@ def main():
     
     training_args.lr_scheduler_type = "cosine_with_min_lr"
     if training_args.warmup_ratio == 0.0:     # HF default → user didn't set it
-        training_args.warmup_ratio = 0.1  #was 0.03
+        training_args.warmup_ratio = WARMUP_RATIO 
     training_args.lr_scheduler_kwargs =  LR_SCHEDULER_KWARGS
     training_args.logging_steps = 10 # Track learning rate
     
     training_args.evaluation_strategy = "steps"
-    training_args.eval_steps = 25 
+    training_args.eval_steps = EVAL_STEPS
     training_args.save_strategy = "steps"
-    training_args.save_steps = 25
+    training_args.save_steps = EVAL_STEPS
     training_args.load_best_model_at_end = True
     
     # Model selection based on Paired Flip Rate
@@ -675,15 +735,9 @@ def main():
     training_args.greater_is_better = True
     
     training_args.optim = "paged_adamw_8bit"
-    training_args.report_to = ["wandb"]
-    if not training_args.run_name:
-        training_args.run_name = (
-            f"venra-weighted-p{PENALTY}-r{model_args.lora_rank}-a{model_args.lora_rank}"
-            f"-lr{training_args.learning_rate}"
-            f"-w{training_args.warmup_ratio}"
-        )    
+    training_args.report_to = ["wandb"]  
     training_args.bf16 = True
-    training_args.max_grad_norm = 0.3
+    training_args.max_grad_norm = MAX_GRAD_NORM
     
     # Memory optimizations
     training_args.gradient_checkpointing = True 
@@ -699,7 +753,7 @@ def main():
     callbacks=[
     sabotage_cb,
     EarlyStoppingCallback(
-        early_stopping_patience=10,  # Stop if no improvement for 10 evals
+        early_stopping_patience=PATIENCE,  # Stop if no improvement for 10 evals
         early_stopping_threshold=0.005  # Min improvement = 0.5%
     )
     ]
@@ -719,7 +773,8 @@ def main():
         tokenizer=tokenizer,
         args=training_args,
         callbacks=callbacks,
-        verdict_token_ids=list(token_map_ids.values())  # [12315, 36965, 3251]
+        verdict_token_ids=list(token_map_ids.values()),  # [12315, 36965, 3251]
+        penalty=PENALTY
     )
 
     if DEBUG:
