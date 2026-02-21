@@ -11,7 +11,7 @@ load_dotenv()
 
 MODEL_ID = "Qwen/Qwen2.5-Coder-3B-Instruct"
 DATASET_REPO = "pagand/venra"
-DATASET_REVISION = "v2.2"
+DATASET_REVISION = "v2.3"
 DATA_DIR = Path("data/training_final")
 
 # Prompt template from src/hal_det/training/prompt_template.txt

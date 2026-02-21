@@ -106,7 +106,7 @@ class PhantomNormalizer:
             "context_chunks": [str(context).strip()],
             
             # Trace: Explicitly denote text-based analysis (No math trace available)
-            "trace_code": "# VERIFICATION_TYPE: TEXT_ANALYSIS\n# Verify via semantic retrieval from long-context documents.",
+            "trace_code": "# VERIFICATION_TYPE: TEXT_ANALYSIS",
             
             # Target
             "target_sentence": str(answer).strip(),

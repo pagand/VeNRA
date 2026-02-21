@@ -110,7 +110,7 @@ class TruthfulQANormalizer:
             "context_chunks": [], 
             
             # Trace: Explicitly denote no retrieval occurred
-            "trace_code": "# VERIFICATION_TYPE: GENERAL_KNOWLEDGE\n# This fact is axiomatic and requires no external evidence context.",
+            "trace_code": "# VERIFICATION_TYPE: TEXT_ANALYSIS",
             
             # Target
             "target_sentence": str(best_answer).strip(),

@@ -160,7 +160,7 @@ class FinanceBenchNormalizer:
             "query": row.get('question', ''),
             "context_chunks": context_chunks,
             # SPEC: Use Text Analysis Token
-            "trace_code": "# VERIFICATION_TYPE: TEXT_ANALYSIS\n# No calculation required. Verify based on semantic matching.",
+            "trace_code": "# VERIFICATION_TYPE: TEXT_ANALYSIS",
             
             # Target
             "target_sentence": row.get('answer', ''),
