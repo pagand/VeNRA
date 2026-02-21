@@ -45,8 +45,8 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF',
 OUTPUT_DIR="./data/output"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-3B-Instruct"
 MULTIPLIER=1 #based on GPU RAM
-LEARNING_RATE=2e-4
-LORA_RANK=96 # was 64
+LEARNING_RATE=1e-4
+LORA_RANK=128 # was 64
 LORA_ALPHA=LORA_RANK # was 32
 MAX_SEQ_LENGTH=4096
 # CUDA Configuration
@@ -59,7 +59,7 @@ GRAD_ACCUM_STEP=32//MULTIPLIER #effective 64
 EVAL_ACCUM_STEP=32
 EVAL_SABOTAGE_BATCH_SIZE=4*MULTIPLIER
 LR_SCHEDULER_KWARGS = {"min_lr": 5e-2*LEARNING_RATE}
-PENALTY=50
+PENALTY=50.0
 PATIENCE=10
 WARMUP_RATIO=0.1
 EVAL_STEPS=25 #eval and save freq
@@ -89,47 +89,73 @@ def build_prompt(
     reasoning:   Optional[str] = None,
 ) -> str:
     """
-    Build a single prompt with smart context truncation.
+    Build a single prompt with smart context truncation and Selective Repetition.
 
     Training mode  : pass label_token + reasoning  → full prompt + completion
     Inference mode : leave label_token=None         → prompt stops at 'Label:'
-                     (model generates the next token)
 
-    Truncation strategy
+    Truncation strategy & Prompt Repetition:
     -------------------
-    All fields except `context` are treated as ESSENTIAL and never truncated.
-    `context` is truncated from the END (the beginning is usually more
-    relevant for financial docs).
+    To overcome the 'lost-in-the-middle' causal attention bottleneck, we state the 
+    Task and Target at the TOP, provide the massive Context, and REPEAT the Target 
+    at the BOTTOM. Context is truncated from the END.
     """
-    system_msg  = "<|im_start|>system\nYou are a financial auditor.<|im_end|>\n"
-    user_prefix = f"<|im_start|>user\nQuery: {query}\n"
+    system_msg  = "<|im_start|>system\nYou are a rigorous financial auditor.<|im_end|>\n"
+    
+    # --- TOP BOOKEND ---
+    # Prime the attention heads: Tell it the task and what to look for BEFORE the massive text.
+    user_prefix = (
+        f"<|im_start|>user\n"
+        f"### TASK:\n"
+        f"Verify if the CLAIMED_ANSWER to the QUERY given the AGENT_TRACE is [Found, Fake, General] based on the EVIDENCE.\n\n"
+        f"### VERIFICATION TARGET:\n"
+        f"**Query:**\n {query}\n"
+        f"**AGENT TRACE (Methodology):**\n {trace}\n"
+        f"**Claimed Answer:**\n {statement}\n\n"
+        f"### EVIDENCE (Source Document):\n"
+    )
+    
+    # --- BOTTOM BOOKEND ---
+    # The 'Let me repeat' triggers cross-attention between the prompt and the deep KV cache.
     user_suffix = (
-        f"Trace: {trace}\nStatement: {statement}\n"
-        f"Task: Classify [Found, Fake, General].<|im_end|>\n"
+        f"\n\n### VERIFICATION TARGET Recap:\n"
+        f"**Query:**\n {query}\n"
+        f"**AGENT TRACE (Methodology):**\n {trace}\n"
+        f"**Claimed Answer:**\n {statement}\n\n"
+        f"### TASK:\n"
+        f"Is the CLAIMED_ANSWER supported by the EVIDENCE? Answer with one of: Found, Fake, General.\n"
+        f"### INSTRUCTIONS\n"
+        f"1.1. Claim is supported and accurate -> Found\n"
+        f"1.2. Claim violates evidence or wrong -> Fake\n"
+        f"1.3. Claim is not verifiable from the EVIDENCE but is a widely world knowledge -> General\n"
+        f"2. Output label (Found, Fake, or General) first, followed by your analysis.<|im_end|>\n"
         f"<|im_start|>assistant\nLabel:"
     )
 
     if label_token is not None and reasoning is not None:
-        # Training: completion is part of the sequence
+        # Training: completion is part of the sequence (Note the leading space for label_token)
         completion = f"{label_token}\nAnalysis: {reasoning}<|im_end|>"
     else:
         # Inference: no completion
         completion = ""
 
     # ---------- budget calculation ----------
+    # We must account for the fact that the Target is duplicated in the budget
     essential      = system_msg + user_prefix + user_suffix + completion
     essential_toks = len(tokenizer.encode(essential, add_special_tokens=False))
     context_budget = max_seq_length - essential_toks - 20   # 20-tok safety margin
 
     # ---------- context truncation ----------
     if context_budget > 50:
-        context_text   = f"Context: {context}\n"
-        context_tokens = tokenizer.encode(context_text, add_special_tokens=False)
+        # We only encode the context, not the prefix "Context: " since that's moved to user_prefix
+        context_tokens = tokenizer.encode(context, add_special_tokens=False)
         if len(context_tokens) > context_budget:
             context_tokens = context_tokens[:context_budget]
             context_text   = tokenizer.decode(context_tokens, skip_special_tokens=True) + "\n"
+        else:
+            context_text   = context + "\n"
     else:
-        context_text = "Context: [Truncated]\n"
+        context_text = "[Truncated]\n"
 
     return system_msg + user_prefix + context_text + user_suffix + completion
 
@@ -214,13 +240,16 @@ class WeightedLabelTrainer(SFTTrainer):
     
     Features:
     1. Configurable penalty on verdict tokens.
-    2. Parameterized loss ceiling to prevent gradient explosions.
-    3. Micro-chunking for OOM safety on large vocabs.
+    2. Optional separate penalty for the General token (verdict_token_ids[2]).
+       Defaults to `penalty` for full backward compatibility.
+    3. Parameterized loss ceiling to prevent gradient explosions.
+    4. Micro-chunking for OOM safety on large vocabs.
     """
     def __init__(self, *args, verdict_token_ids, penalty=50.0, loss_ceiling=None, chunk_size=512, **kwargs):
         super().__init__(*args, **kwargs)
         self.verdict_token_ids = verdict_token_ids
         self.penalty = penalty
+        self.general_penalty = 10.0 # was penalty
         self.loss_ceiling = loss_ceiling if loss_ceiling is not None else 5.0 * penalty
         self.chunk_size = chunk_size
 
@@ -230,10 +259,21 @@ class WeightedLabelTrainer(SFTTrainer):
             if tid < vocab_size:
                 self.token_weights[tid] = self.penalty
 
+        # Override General token weight if a separate penalty was requested.
+        if len(self.verdict_token_ids) >= 3:
+            general_tid = self.verdict_token_ids[2]
+            if general_tid < vocab_size:
+                self.token_weights[general_tid] = self.general_penalty
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Pop labels BEFORE the forward pass so the model does not compute its own
+        # internal cross-entropy allocating a full [batch, seq_len, vocab_size] tensor in one shot
+        # The chunked loss below owns the loss computation entirely.
+        labels = inputs.pop("labels")
         outputs = model(**inputs)
+        inputs["labels"] = labels  # Restore so HF internals stay consistent
+
         logits = outputs.get("logits")
-        labels = inputs.get("labels")
 
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
@@ -635,8 +675,8 @@ def main():
     # Check environment variables
     check_env_vars()
     
-    print(f"Loading dataset pagand/venra (v2.2)...")
-    dataset = load_dataset("pagand/venra", revision="v2.2")
+    print(f"Loading dataset pagand/venra (v2.3)...")
+    dataset = load_dataset("pagand/venra", revision="v2.3")
     
     print(f"Initializing tokenizer: {model_args.model_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -646,6 +686,37 @@ def main():
     )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right" 
+
+    if DEBUG:
+        print("\n" + "="*80)
+        print("DEBUG MODE: Prompt Preview (Train + Validation)")
+        print("="*80)
+
+        # ---- TRAIN SAMPLE ----
+        train_sample = dataset["train"][0]
+        train_prompt = format_prompt_func(
+            {k: [v] for k, v in train_sample.items()},
+            tokenizer,
+            MAX_SEQ_LENGTH
+        )[0]
+
+        print("\n----- TRAIN SAMPLE PROMPT -----\n")
+        print(train_prompt)
+        print("\nToken count:", len(tokenizer.encode(train_prompt)))
+        print("-"*80)
+
+        # ---- VALIDATION SAMPLE ----
+        val_sample = dataset["validation"][0]
+        val_prompt = format_prompt_func(
+            {k: [v] for k, v in val_sample.items()},
+            tokenizer,
+            MAX_SEQ_LENGTH
+        )[0]
+
+        print("\n----- VALIDATION SAMPLE PROMPT -----\n")
+        print(val_prompt)
+        print("\nToken count:", len(tokenizer.encode(val_prompt)))
+        print("="*80 + "\n")
     
     # Verify Orthogonal Token Mapping
     print("Verifying Orthogonal Token Mapping...")
@@ -778,30 +849,30 @@ def main():
     )
 
     if DEBUG:
-        sample = dataset['train'][0]
+        print("\n" + "="*80)
+        print("DEBUG MODE: Collator + Loss Mask Inspection")
+        print("="*80)
+
+        sample = dataset["train"][0]
         formatted = format_prompt_func(
-            {k: [v] for k, v in sample.items()}, 
-            tokenizer, 
+            {k: [v] for k, v in sample.items()},
+            tokenizer,
             MAX_SEQ_LENGTH
         )[0]
 
-        tokens = tokenizer(formatted, return_tensors='pt')
-        input_ids = tokens['input_ids'][0]
+        tokens = tokenizer(formatted, return_tensors="pt")
+        batch = collator([{
+            "input_ids": tokens["input_ids"][0].tolist(),
+            "attention_mask": tokens["attention_mask"][0].tolist(),
+        }])
 
-        # Find where "\nLabel:" appears
-        label_token_ids = tokenizer.encode("\nLabel:", add_special_tokens=False)
-        print(f"Looking for token IDs: {label_token_ids}")
+        labels = batch["labels"][0]
+        active_tokens = (labels != -100).sum().item()
 
-        # Check if collator finds it
-        batch = collator([{'input_ids': input_ids.tolist(), 
-                        'attention_mask': [1]*len(input_ids)}])
-        labels = batch['labels'][0]
-
-        # Count non-masked tokens (-100 = masked)
-        active = (labels != -100).sum().item()
-        print(f"Tokens with loss computed: {active}")
-        # If this is 0 or very small: YOUR COLLATOR IS BROKEN
-        # Should be ~115 tokens (the completion part)
+        print(f"Total tokens: {labels.shape[0]}")
+        print(f"Tokens contributing to loss: {active_tokens}")
+        print("Expected: identified \"\\nLabel:\" as the cutoff. and masked out rest of prompt tokens.")
+        print("="*80 + "\n")
 
     print("\n" + "="*80)
     print("PHASE 1 TRAINING: Baseline QLoRA + rsLoRA")
