@@ -44,7 +44,7 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF',
 # ---------------------------------------------------------------------------
 OUTPUT_DIR="./data/output"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-3B-Instruct"
-MULTIPLIER=1 #based on GPU RAM
+MULTIPLIER=2 #based on GPU RAM
 LEARNING_RATE=1e-4
 LORA_RANK=128 # was 64
 LORA_ALPHA=LORA_RANK # was 32
@@ -52,7 +52,7 @@ MAX_SEQ_LENGTH=4096
 # CUDA Configuration
 CUDA_VISIBLE_DEVICES=0
 #training config
-NUM_TRAIN_EPOCHS=5
+NUM_TRAIN_EPOCHS=10
 TRAIN_BATCH_SIZE=2*MULTIPLIER
 EVAL_BATCH_SIZE=3*MULTIPLIER
 GRAD_ACCUM_STEP=32//MULTIPLIER #effective 64
@@ -60,7 +60,7 @@ EVAL_ACCUM_STEP=32
 EVAL_SABOTAGE_BATCH_SIZE=4*MULTIPLIER
 LR_SCHEDULER_KWARGS = {"min_lr": 5e-2*LEARNING_RATE}
 PENALTY=50.0
-PATIENCE=10
+PATIENCE=15
 WARMUP_RATIO=0.1
 EVAL_STEPS=25 #eval and save freq
 MAX_GRAD_NORM=0.3
@@ -124,11 +124,13 @@ def build_prompt(
         f"**Claimed Answer:**\n {statement}\n\n"
         f"### TASK:\n"
         f"Is the CLAIMED_ANSWER supported by the EVIDENCE? Answer with one of: Found, Fake, General.\n"
-        f"### INSTRUCTIONS\n"
-        f"1.1. Claim is supported and accurate -> Found\n"
-        f"1.2. Claim violates evidence or wrong -> Fake\n"
-        f"1.3. Claim is not verifiable from the EVIDENCE but is a widely world knowledge -> General\n"
-        f"2. Output label (Found, Fake, or General) first, followed by your analysis.<|im_end|>\n"
+        f"### AUDIT ALGORITHM (CRITICAL):\n"
+        f"Do NOT recalculate the math. Assume the arithmetic in the trace evaluates to the Claimed Answer. You must verify the EXTRACTION and LOGIC:\n"
+        f"1. EXTRACTION CHECK: Are ALL specific numbers, dates, and entities used in the AGENT TRACE explicitly present in the EVIDENCE? If any number is fabricated or pulled from the wrong row/column -> Fake\n"
+        f"2. LOGIC CHECK: Does the AGENT TRACE use the correct operation and the correct metrics to answer the QUERY? If it answers the wrong question or uses the wrong year -> Fake\n"
+        f"3. AXIOM CHECK: If the EVIDENCE is irrelevant, but the Claimed Answer is a widely known universal fact -> General\n"
+        f"4. If Extraction and Logic are both supported by the EVIDENCE -> Found\n\n"
+        f"Output your label (Found, Fake, or General) first, followed by your analysis.<|im_end|>\n"
         f"<|im_start|>assistant\nLabel:"
     )
 
@@ -575,7 +577,6 @@ class SabotageEvalCallback(TrainerCallback):
         fr_short, ece_short, pa_short, ca_short, n_short = compute_pair_metrics("pair_short_parent")
         fr_long,  ece_long,  pa_long,  ca_long,  n_long  = compute_pair_metrics("pair_long_parent")
 
-        total_pairs = n_short + n_long
         def weighted(a, na, b, nb):
             denom = na + nb
             return (a * na + b * nb) / denom if denom > 0 else 0.0
@@ -601,10 +602,27 @@ class SabotageEvalCallback(TrainerCallback):
         n_axioms   = axiom_mask.sum()
         acc_axiom  = float(np.mean(preds_np[axiom_mask] == 2)) if n_axioms > 0 else 0.0
 
-        # ── Composite Score (ADDED, normalized [0,1]) ─────────────────────────
+        # compute combined counts for FR (you already do weighted mean; recompute successes)
+        s_fr = fr_short * n_short + fr_long * n_long
+        n_fr = n_short + n_long
+        # posterior-mean (Jeffreys prior) using a near-zero prior (alpha tiny, beta = 1).
+        def posterior_mean(m_times_n, n, prior_a=1e-6, prior_b=1.0):
+            if n <= 0:
+                return 0.0
+            # allow fractional successes: s = m * n
+            s = m_times_n
+            return (prior_a + s) / (prior_a + prior_b + n)
+
+        # get posterior means for each pillar
+        pm_fr    = posterior_mean(s_fr, n_fr)
+        pm_recall= posterior_mean(recall_nat_fake * n_nat_fake, n_nat_fake)
+        pm_tpr   = posterior_mean(tpr_nat_true * n_nat_true, n_nat_true)
+        pm_axiom = posterior_mean(acc_axiom * n_axioms, n_axioms)
+
+        # final composite (same sqrt-product punishment)
         # Multiplication across four capability pillars.
         # Penalizes FPR directly: high FPR → lower tpr_nat_true → lower score.
-        composite = fr_global * recall_nat_fake * tpr_nat_true * acc_axiom
+        composite = (pm_fr**0.5) * (pm_recall**0.5) * (pm_tpr**0.5) * (pm_axiom**0.5)
 
         # ── Print ─────────────────────────────────────────────────────────────
         print(f"\n[Comprehensive Audit] Step {state.global_step}")
