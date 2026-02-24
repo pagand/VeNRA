@@ -82,13 +82,13 @@ def test_table_melter_mixed_scale_exception():
     
     # 1. Check Net Income (Should be scaled)
     net_income = next(r for r in rows if r.metric_name == "Net Income")
-    assert net_income.value == 500_000_000.0
+    assert net_income.num_value == 500_000_000.0
     
     # 2. Check EPS (Should NOT be scaled)
     eps = next(r for r in rows if "Earnings Per Share" in r.metric_name)
-    assert eps.value == 5.25 # MUST equal raw value
-    assert eps.scale_factor == 1.0
-    assert eps.unit == "USD/Share" # Optional: Check if unit inference works
+    assert eps.num_value == 5.25 # MUST equal raw value
+    assert eps.scale == 1.0
+    assert eps.unit_normalized == "USD/Share" # Optional: Check if unit inference works
 
 def test_table_melter_hierarchical_indentation():
     """
@@ -111,8 +111,8 @@ def test_table_melter_hierarchical_indentation():
     rows = melter.melt(block)
     
     # We expect flattened names
-    asset_cash = next(r for r in rows if r.value == 100.0)
-    liability_cash = next(r for r in rows if r.value == -50.0)
+    asset_cash = next(r for r in rows if r.num_value == 100.0)
+    liability_cash = next(r for r in rows if r.num_value == -50.0)
     
     # Flexible assertion depending on your implementation style
     # Ideally: "Assets > Current Assets > Cash"
@@ -179,15 +179,15 @@ def test_table_melter_restated_columns():
     
     assert len(rows) == 2
     
-    orig = next(r for r in rows if r.value == 100.0)
-    restated = next(r for r in rows if r.value == 95.0)
+    orig = next(r for r in rows if r.num_value == 100.0)
+    restated = next(r for r in rows if r.num_value == 95.0)
     
     # 1. Ensure IDs are different
     assert orig.row_id != restated.row_id
     
     # 2. Check nuance note or period modification
     # Implementation choice: Either modify period "2022-RESTATED" or add note
-    assert "Restated" in restated.nuance_note or "Restated" in restated.period
+    assert "Restated" in restated.text_nuance
 
 # ==========================================
 # Feature: Semantic Schema & Embedding
@@ -211,8 +211,8 @@ def test_semantic_schema_embedding_call():
     indexer = ContextIndexer(embedding_fn=mock_embedding_fn)
     
     row = UFLRow(
-        row_id="1", entity_id="A", entity_name_raw="Alpha Corp", metric_name="Revenue", 
-        value=10, period="2023", doc_section="A", source_chunk_id="C", confidence=1
+        row_id="1", canonical_entity_id="A", entity_name_raw="Alpha Corp", metric_name="Revenue", grounding_quote="dummy", 
+        num_value=10, period_end="2023", doc_section="A", source_chunk_id="C", confidence_score=1
     )
     
     # Verify method runs without error using the mock
@@ -233,29 +233,34 @@ async def test_text_synthesizer_relationships():
         section_path=["Concentration Risk"]
     )
     
-    mock_resp = FactExtractionResponse(facts=[
-        ScrapedFact(
-            metric_name="Customer Concentration",
-            value=0.15,
-            unit="Percent",
-            period="2023",
-            related_entity="Boeing", # This is the key field
-            confidence=1.0
-        )
-    ])
+    mock_fact = ScrapedFact(
+        metric_name="Customer Concentration", grounding_quote="dummy",
+        num_value=0.15,
+        unit_normalized="Percent",
+        period_start="2023",
+        related_entity="Boeing", # This is the key field
+        confidence=1.0
+    )
     
-    with patch("venra.synthesis.instructor.from_openai") as mock_init:
+    # Mock OpenAI client used in TextSynthesizer._single_pass
+    with patch("venra.synthesis.OpenAI") as mock_openai_init:
         mock_client = MagicMock()
-        mock_init.return_value = mock_client
-        mock_client.chat.completions.create.return_value = mock_resp
+        mock_openai_init.return_value = mock_client
         
-        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
-        rows = await synthesizer.extract_facts(block)
+        # Mock completion response
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"facts": [' + mock_fact.model_dump_json() + ']}'
+        mock_client.chat.completions.create.return_value.choices = [mock_choice]
         
-        row = rows[0]
-        assert row.related_entity_id == "Boeing" 
-        # Note: In a real system, "Boeing" should also go through EntityResolution to get "ID_BA".
-        # For this unit test, asserting the field presence is enough.
+        # Also mock the aligner to return the same facts
+        with patch("venra.synthesis.PostHocAligner.align", side_effect=lambda f, **kw: f):
+            synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+            rows = await synthesizer.extract_facts(block)
+            
+            row = rows[0]
+            # related_entity name is now preserved in text_nuance until resolved
+            assert "Boeing" in row.text_nuance
+            assert row.related_entity_id is None
 
 
 # ==========================================
@@ -282,20 +287,21 @@ def test_table_melter_cleaning_heuristics():
     rows = melter.melt(block)
     
     # 1. Check Footnote Stripping
-    debt_2023 = next(r for r in rows if r.metric_name == "Debt" and r.period == "2023")
-    assert debt_2023.value == 1234.0, f"Failed to strip footnote, got {debt_2023.value}"
+    # Current TableMelter puts the year in period_end for point-in-time metrics.
+    debt_2023 = next(r for r in rows if r.metric_name == "Debt" and r.period_end == "2023")
+    assert debt_2023.num_value == 1234.0, f"Failed to strip footnote, got {debt_2023.num_value}"
     
     # 2. Check Dash -> Zero
-    gain_2023 = next(r for r in rows if r.metric_name == "Derivative Gain" and r.period == "2023")
-    assert gain_2023.value == 0.0, "Em-dash should be 0.0"
+    gain_2023 = next(r for r in rows if r.metric_name == "Derivative Gain" and r.period_end == "2023")
+    assert gain_2023.num_value == 0.0, "Em-dash should be 0.0"
     
     # 3. Check Hyphen -> Zero
-    gain_2022 = next(r for r in rows if r.metric_name == "Derivative Gain" and r.period == "2022")
-    assert gain_2022.value == 0.0, "Hyphen should be 0.0"
+    gain_2022 = next(r for r in rows if r.metric_name == "Derivative Gain" and r.period_end == "2022")
+    assert gain_2022.num_value == 0.0, "Hyphen should be 0.0"
 
     # 4. Check Blank -> None
-    obscure_2023 = next(r for r in rows if r.metric_name == "Obscure Item" and r.period == "2023")
-    assert obscure_2023.value is None, "Blank cell should be None/NaN"
+    obscure_2023 = next(r for r in rows if r.metric_name == "Obscure Item" and r.period_end == "2023")
+    assert obscure_2023.num_value is None, "Blank cell should be None/NaN"
 
 # ==========================================
 # SME Case 2: Inequalities & Thresholds
@@ -312,27 +318,29 @@ async def test_text_synthesizer_inequalities():
         section_path=["Outlook"]
     )
     
-    mock_resp = FactExtractionResponse(facts=[
-        ScrapedFact(
-            metric_name="Projected Capex",
-            value=50_000_000.0,
-            unit="USD",
-            nuance_note="operator: < (less than)", # The extractor prompt must be trained for this
-            confidence=0.9
-        )
-    ])
+    mock_fact = ScrapedFact(
+        metric_name="Projected Capex", grounding_quote="dummy",
+        num_value=50_000_000.0,
+        unit_normalized="USD",
+        text_nuance="operator: < (less than)", # The extractor prompt must be trained for this
+        confidence=0.9
+    )
     
-    with patch("venra.synthesis.instructor.from_openai") as mock_init:
+    with patch("venra.synthesis.OpenAI") as mock_openai_init:
         mock_client = MagicMock()
-        mock_init.return_value = mock_client
-        mock_client.chat.completions.create.return_value = mock_resp
+        mock_openai_init.return_value = mock_client
         
-        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
-        rows = await synthesizer.extract_facts(block)
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"facts": [' + mock_fact.model_dump_json() + ']}'
+        mock_client.chat.completions.create.return_value.choices = [mock_choice]
         
-        row = rows[0]
-        assert row.value == 50_000_000.0
-        assert "<" in row.nuance_note or "less than" in row.nuance_note
+        with patch("venra.synthesis.PostHocAligner.align", side_effect=lambda f, **kw: f):
+            synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+            rows = await synthesizer.extract_facts(block)
+            
+            row = rows[0]
+            assert row.num_value == 50_000_000.0
+            assert "<" in row.text_nuance or "less than" in row.text_nuance
 
 # ==========================================
 # SME Case 3: The "Basis Point" Unit
@@ -343,29 +351,31 @@ async def test_text_synthesizer_basis_points():
     """
     SME REQUIREMENT:
     '50 basis points' is a distinct unit. Do not convert to 0.005 implicitly unless standardized.
-    Better to keep unit='bps' so the Agent knows the math rules.
+    Better to keep unit_normalized='bps' so the Agent knows the math rules.
     """
     block = TextBlock(content="Gross margin improved by 120 basis points.", section_path=[])
     
-    mock_resp = FactExtractionResponse(facts=[
-        ScrapedFact(
-            metric_name="Gross Margin Change",
-            value=120.0,
-            unit="bps", # The extractor should identify this unit
-            confidence=0.95
-        )
-    ])
+    mock_fact = ScrapedFact(
+        metric_name="Gross Margin Change", grounding_quote="dummy",
+        num_value=120.0,
+        unit_normalized="bps", # The extractor should identify this unit
+        confidence=0.95
+    )
     
-    with patch("venra.synthesis.instructor.from_openai") as mock_init:
+    with patch("venra.synthesis.OpenAI") as mock_openai_init:
         mock_client = MagicMock()
-        mock_init.return_value = mock_client
-        mock_client.chat.completions.create.return_value = mock_resp
+        mock_openai_init.return_value = mock_client
         
-        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
-        rows = await synthesizer.extract_facts(block)
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"facts": [' + mock_fact.model_dump_json() + ']}'
+        mock_client.chat.completions.create.return_value.choices = [mock_choice]
         
-        assert rows[0].value == 120.0
-        assert rows[0].unit == "bps"
+        with patch("venra.synthesis.PostHocAligner.align", side_effect=lambda f, **kw: f):
+            synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+            rows = await synthesizer.extract_facts(block)
+            
+            assert rows[0].num_value == 120.0
+            assert rows[0].unit_normalized == "bps"
 
 # ==========================================
 # SME Case 4: Non-Numeric Entity Graph
@@ -376,7 +386,7 @@ async def test_graph_relationship_extraction():
     """
     SME REQUIREMENT:
     Extract knowledge graph edges where no money is involved.
-    'Company A owns Company B' -> metric='Subsidiary', related_entity='Company B', value=NaN.
+    'Company A owns Company B' -> metric='Subsidiary', related_entity='Company B', num_value=NaN.
     """
     block = TextBlock(
         content="Our primary operating subsidiaries include Champion Aerospace and Avionic Instruments.",
@@ -384,30 +394,34 @@ async def test_graph_relationship_extraction():
     )
     
     # We expect the LLM to return TWO facts here
-    mock_resp = FactExtractionResponse(facts=[
-        ScrapedFact(
-            metric_name="Subsidiary",
-            value=None,
-            related_entity="Champion Aerospace",
-            confidence=1.0
-        ),
-        ScrapedFact(
-            metric_name="Subsidiary",
-            value=None,
-            related_entity="Avionic Instruments",
-            confidence=1.0
-        )
-    ])
+    fact1 = ScrapedFact(
+        metric_name="Subsidiary", grounding_quote="dummy",
+        num_value=None,
+        related_entity="Champion Aerospace",
+        confidence=1.0
+    )
+    fact2 = ScrapedFact(
+        metric_name="Subsidiary", grounding_quote="dummy",
+        num_value=None,
+        related_entity="Avionic Instruments",
+        confidence=1.0
+    )
     
-    with patch("venra.synthesis.instructor.from_openai") as mock_init:
+    with patch("venra.synthesis.OpenAI") as mock_openai_init:
         mock_client = MagicMock()
-        mock_init.return_value = mock_client
-        mock_client.chat.completions.create.return_value = mock_resp
+        mock_openai_init.return_value = mock_client
         
-        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
-        rows = await synthesizer.extract_facts(block)
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"facts": [' + fact1.model_dump_json() + ', ' + fact2.model_dump_json() + ']}'
+        mock_client.chat.completions.create.return_value.choices = [mock_choice]
         
-        assert len(rows) == 2
-        assert rows[0].metric_name == "Subsidiary"
-        assert rows[0].related_entity_id == "Champion Aerospace" # Note: Needs normalization in real app
-        assert rows[0].value is None
+        with patch("venra.synthesis.PostHocAligner.align", side_effect=lambda f, **kw: f):
+            synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+            rows = await synthesizer.extract_facts(block)
+            
+            assert len(rows) == 2
+            assert rows[0].metric_name == "Subsidiary"
+            # related_entity name is now preserved in text_nuance until resolved
+            assert "Champion Aerospace" in rows[0].text_nuance
+            assert rows[0].related_entity_id is None
+            assert rows[0].num_value is None

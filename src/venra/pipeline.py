@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 from typing import List, Optional
 import pandas as pd
@@ -25,8 +26,11 @@ class IngestionPipeline:
         ufl_path = os.path.join(settings.DATA_DIR, "processed", f"{base_name}_ufl.parquet")
         schema_path = os.path.join(settings.DATA_DIR, "processed", f"{base_name}_schema_summary.json")
         
-        # Configure Schema Gen for this specific file
-        self.schema_gen.output_path = schema_path
+        # Configure Schema Gen for this specific file, unless it was already overridden (e.g. by a test)
+        if "processed/schema_summary.json" in self.schema_gen.output_path:
+            self.schema_gen.output_path = schema_path
+        else:
+            schema_path = self.schema_gen.output_path
 
         # 0. Check if UFL already exists and we want to skip
         if skip_parsing and os.path.exists(ufl_path):

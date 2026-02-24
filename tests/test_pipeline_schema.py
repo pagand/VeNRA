@@ -88,9 +88,9 @@ def test_schema_generator_logic():
     
     # Add dummy rows
     rows = [
-        UFLRow(row_id="1", entity_id="ID_TEST", metric_name="Revenue", value=100.0, period="2023", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence=1.0),
-        UFLRow(row_id="2", entity_id="ID_TEST", metric_name="Revenue", value=110.0, period="2022", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence=1.0),
-        UFLRow(row_id="3", entity_id="ID_TEST", metric_name="EBITDA", value=20.0, period="2023", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence=1.0),
+        UFLRow(row_id="1", canonical_entity_id="ID_TEST", metric_name="Revenue", grounding_quote="dummy", num_value=100.0, period_start="2023", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence_score=1.0),
+        UFLRow(row_id="2", canonical_entity_id="ID_TEST", metric_name="Revenue", grounding_quote="dummy", num_value=110.0, period_start="2022", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence_score=1.0),
+        UFLRow(row_id="3", canonical_entity_id="ID_TEST", metric_name="EBITDA", grounding_quote="dummy", num_value=20.0, period_start="2023", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence_score=1.0),
     ]
     gen.add_rows(rows)
     

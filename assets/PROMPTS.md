@@ -10,29 +10,53 @@
 1.  **Identify Facts:**
     *   **Numerical:** Revenue, income, expenses, interest rates, percentages.
     *   **Events & Qualitative:** Acquisitions, divestitures, legal rulings, risk factors, denominations. These are facts even if no dollar amount is mentioned.
+    *   **Empty Result:** If the text is purely boilerplate, titles, or contains no extractable facts, you MUST return an empty list `[]`. Do NOT invent facts or copy examples.
+    *   **No Phantom Metrics:** Do NOT invent a `metric_name` (like "Revenue" or "Net Income") if the text does not explicitly state a value or qualitative fact about it. The presence of a date (e.g. "Fiscal Year 2025") does NOT mean you should extract a "Revenue" fact. Only extract metrics that are explicitly present or unequivocally implied by the text.
+    *   **No Bulk Hallucination:** If the text only contains an administrative detail (e.g., a file number, a date), extract ONLY that detail. DO NOT hallucinate an entire income statement or balance sheet of unrelated metrics.
 2.  **Handling Numbers (CRITICAL):**
-    *   **STRICT TRUTH:** NEVER guess or hallucinate a number. If a metric is mentioned but NO numeric value is associated with it in the provided text, you MUST set `value` to `null`.
-    *   Normalize values to raw floats.
+    *   **STRICT TRUTH:** NEVER guess or hallucinate a number. If a metric is mentioned but NO numeric value is associated with it in the provided text, you MUST set `num_value` to `null`.
+    *   Normalize values to raw floats in `num_value`.
+    *   **Grounding Quote:** You MUST extract the exact verbatim substring from the text that justifies this fact into `grounding_quote` (e.g., "$10 million", "15%", or "substantially all"). This is REQUIRED for both numerical and qualitative facts. Do not paraphrase.
     *   **Scaling Guide:** Use any provided context (like footnotes) to scale numbers. (e.g., a number with "in millions" context should be multiplied by 1,000,000.0).
-    *   **Percentages:** "15%" should be extracted as `value=15.0` and `unit="Percent"`. Do NOT convert to 0.15.
+    *   **Percentages:** "15%" should be extracted as `num_value=15.0` and `unit_normalized="Percent"`. Do NOT convert to 0.15.
+    *   **Units:** You MUST provide a string for `unit_normalized` (e.g., "USD", "Ratio", "Percent", "Units"). If the fact is purely qualitative or has no obvious unit, use "N/A" or "Other". NEVER set `unit_normalized` to `null`.
 3.  **Nuance & Scope:**
-    *   **Quantifiers:** Capture words that define scope (e.g., "substantially all", "majority of", "approximately") in the `nuance_note`.
-    *   **Adjustments:** If a value is "Adjusted", capture the final value and describe the adjustment reason in `nuance_note`.
+    *   **Quantifiers:** Capture words that define scope (e.g., "substantially all", "majority of", "approximately") in the `text_nuance`. For example, if revenue is denominated in USD, put "Substantially all in USD" in nuance.
+    *   **Comparisons & Growth:** Capture relative phrasing (e.g., "increased by", "compared to the prior year period") in the `text_nuance`.
+    *   **Adjustments:** If a value is "Adjusted", capture the final value and describe the adjustment reason in `text_nuance`.
+    *   **Related Entities:** If the fact involves another entity (e.g. a supplier, customer, or subsidiary), capture its name in `related_entity`.
+    *   **Negative Assurance:** If the text explicitly states the absence of something (e.g., "no off-balance sheet arrangements"), extract the metric, set `num_value` to `null`, and put "Explicit Negative Assurance: <verbatim statement>" in the `text_nuance`.
+    *   **Constraints & Limits:** If a number represents a required limit or covenant (e.g., "not exceeding 3.50"), extract the number into `num_value`, but append "Limit" or "Ceiling" to the `metric_name` and describe the constraint in `text_nuance`.
+    *   **No Copying Examples:** NEVER copy the `text_nuance` or `metric_name` exactly from the prompt examples (like "Required under credit facility") unless it actually appears in the text. Synthesize the nuance from the text provided.
 4.  **Temporal Anchoring (Date Resolution):**
     *   Use the `Context Info` as your temporal anchor.
-    *   **Resolution Rule:** You MUST calculate the specific year.
-        *   If Context is "FY 2023" and text says "prior year", set `period="2022"`.
+    *   **Resolution Rule:** You MUST calculate the specific year for `period_start` and/or `period_end`. This applies to ALL facts (numerical, qualitative, events).
+        *   If Context is "FY 2023" and text says "prior year" or "last year", set `period_end="2022"`.
         *   Do NOT output "prior year" or "unknown" if a context anchor is available.
-5.  **Strict Schema:** Return a JSON object matching the schema. Set `value` to `null` for qualitative facts.
+5.  **Strict Schema:** Return a JSON object matching the schema. Always include `confidence` (a float between 0.0 and 1.0 representing your certainty).
 
 **Example 1 (Numerical with Scaling):**
-Text: "Revenue increased by $10 for the year."
+Text: "Revenue increased by $10 for the year compared to the prior period."
 Context: "Dollars in millions. Current Year: 2023"
-Output Fact: `{"metric_name": "Revenue Increase", "value": 10000000.0, "unit": "USD", "period": "2023"}`
+Output: `{"facts": [{"metric_name": "Revenue Increase", "num_value": 10000000.0, "grounding_quote": "$10", "unit_normalized": "USD", "period_end": "2023", "text_nuance": "compared to the prior period", "confidence": 0.95}]}`
 
-**Example 2 (Qualitative):**
-Text: "We acquired several small businesses."
-Output Fact: `{"metric_name": "Acquisitions", "value": null, "unit": "USD", "nuance_note": "several small businesses"}`
+**Example 2 (Qualitative & Quantifiers):**
+Text: "In the prior year, substantially all of our revenue was generated from several small businesses we acquired."
+Context: "Current Year: 2023"
+Output: `{"facts": [{"metric_name": "Revenue Generation Source", "num_value": null, "grounding_quote": "substantially all of our revenue was generated from several small businesses we acquired", "unit_normalized": "N/A", "period_end": "2022", "text_nuance": "substantially all", "confidence": 0.90}, {"metric_name": "Acquisitions", "num_value": null, "grounding_quote": "acquired several small businesses", "unit_normalized": "N/A", "period_end": "2022", "text_nuance": "several small businesses", "confidence": 0.90}]}`
+
+**Example 3 (No Facts - Boilerplate):**
+Text: "TransDigm Group Incorporated (Exact name of registrant as specified in its charter)"
+Output: `{"facts": []}`
+
+**Example 4 (Constraint/Covenant):**
+Text: "We are required to maintain a minimum liquidity of at least $50 million under the credit facility."
+Context: "Current Year: 2023"
+Output: `{"facts": [{"metric_name": "Minimum Liquidity Limit", "num_value": 50000000.0, "grounding_quote": "$50 million", "unit_normalized": "USD", "text_nuance": "Required under credit facility", "confidence": 0.95}]}`
+
+**Example 5 (Negative Assurance):**
+Text: "We do not hold any derivative financial instruments."
+Output: `{"facts": [{"metric_name": "Derivative Financial Instruments", "num_value": null, "grounding_quote": "do not hold any derivative financial instruments", "unit_normalized": "N/A", "text_nuance": "Explicit Negative Assurance: We do not hold any derivative financial instruments", "confidence": 0.95}]}`
 
 **Input Context:**
 *   **Section Path:** {{section_path}}

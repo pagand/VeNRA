@@ -23,7 +23,7 @@ def test_verify_endpoint_success(mock_judge_api):
         "grounded": 0.95,
         "common": 0.03,
         "hallucination": 0.02,
-        "top_class": "GROUNDED"
+        "prediction": "GROUNDED"
     }
     mock_judge_api.return_value = mock_response
 
@@ -49,13 +49,13 @@ def test_verify_endpoint_mixed_results(mock_judge_api):
     mock_grounded = MagicMock()
     mock_grounded.status_code = 200
     mock_grounded.json.return_value = {
-        "grounded": 0.9, "common": 0.05, "hallucination": 0.05, "top_class": "GROUNDED"
+        "grounded": 0.9, "common": 0.05, "hallucination": 0.05, "prediction": "GROUNDED"
     }
 
     mock_hallucination = MagicMock()
     mock_hallucination.status_code = 200
     mock_hallucination.json.return_value = {
-        "grounded": 0.1, "common": 0.1, "hallucination": 0.8, "top_class": "HALLUCINATION"
+        "grounded": 0.1, "common": 0.1, "hallucination": 0.8, "prediction": "HALLUCINATION"
     }
 
     mock_judge_api.side_effect = [mock_grounded, mock_hallucination]

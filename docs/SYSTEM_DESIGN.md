@@ -28,8 +28,13 @@ We move from "Retrieving Text" to "Retrieving Variables." We replace probabilist
     * We do not naively chunk text. We parse the PDF into a **Document Tree**.
     * **Context Stack:** We maintain a stack of headers (e.g., `['MD&A', 'Liquidity']`) during parsing. When a table is found, this stack is injected into the table's metadata.
 3.  **The Outcome:**
-    * **UFL (Parquet):** A deterministic table of variables (`row_id`, `value`, `period`, `metric`).
-    * **Vector Store (ChromaDB):** Text chunks that contain *explicit links* (`contains_rows: [row_ids]`) back to the UFL.
+    *   **UFL (Parquet):** A deterministic table of variables (`row_id`, `value`, `period`, `metric`).
+    *   **Vector Store (ChromaDB):** Text chunks that contain *explicit links* (`contains_rows: [row_ids]`) back to the UFL.
+4.  **The "Double Lock" Grounding (Post-Hoc Verification):**
+    *   **Lock 1 (Mechanical):** Every LLM extraction is reverse-grounded against the source text to verify the physical existence of the number/quote (`grounding_quote`).
+    *   **Lock 2 (Semantic):** Every extraction must pass a "Metric Grounding" gate where the core keywords of the `metric_name` (e.g., "Revenue") must literally appear in the source chunk or its hierarchy path.
+    *   **Result:** This dual-verification eliminates both numerical hallucinations (invented numbers) and semantic hallucinations (real numbers assigned to the wrong variables).
+
 
 ### Component B: The "Smart Filter" Retrieval (Runtime)
 

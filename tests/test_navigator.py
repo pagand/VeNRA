@@ -24,7 +24,6 @@ async def test_navigator_generates_plan(mock_schema_file):
     Test that Navigator correctly parses a query into a RetrievalPlan using mocked LLM.
     """
     mock_plan = RetrievalPlan(
-        strategy="HYBRID",
         ufl_query={
             "entity_ids": ["ID_TDG"],
             "metric_keywords": ["Net Sales", "Revenue"],
@@ -44,7 +43,6 @@ async def test_navigator_generates_plan(mock_schema_file):
         nav = Navigator(api_key="fake", schema_path=mock_schema_file)
         plan = await nav.navigate("What were TransDigm's sales in 2023?")
         
-        assert plan.strategy == "HYBRID"
         assert "ID_TDG" in plan.ufl_query.entity_ids
         assert "Net Sales" in plan.ufl_query.metric_keywords
         
@@ -67,5 +65,5 @@ async def test_navigator_fallback_on_error(mock_schema_file):
         nav = Navigator(api_key="fake", schema_path=mock_schema_file)
         plan = await nav.navigate("Some query")
         
-        assert plan.strategy == "TEXT_ONLY"
+        assert plan.ufl_query is None
         assert "Navigation error" in plan.reasoning

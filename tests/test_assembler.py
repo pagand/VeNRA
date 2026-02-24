@@ -7,10 +7,10 @@ def test_assembler_deduplication():
     
     # Duplicate Rows
     row = UFLRow(
-        row_id="row1", entity_id="ID_T", entity_name_raw="Test",
-        metric_name="Revenue", value=100.0, unit="USD", period="2023",
+        row_id="row1", canonical_entity_id="ID_T", entity_name_raw="Test",
+        metric_name="Revenue", grounding_quote="dummy", num_value=100.0, unit_normalized="USD", period_start="2023",
         doc_section="S1", source_chunk_id="chunk1",
-        confidence=1.0
+        confidence_score=1.0
     )
     
     # Duplicate Chunks
