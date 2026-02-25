@@ -31,6 +31,7 @@ from peft import LoraConfig, prepare_model_for_kbit_training, TaskType
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import wandb
 from dotenv import load_dotenv
+from src.hal_det.prompt_builder import build_prompt
 
 
 load_dotenv()
@@ -66,6 +67,7 @@ EVAL_STEPS=25 #eval and save freq
 MAX_GRAD_NORM=0.3
 RETRAIN=False
 DEBUG=False
+PROMPT_TYPE = "full"  # "full" or "noinstruct"
 # Orthogonal Token Mapping (Spec Section 3.1)
 TOKEN_MAP = {
     "Supported": " Found",   # ID: 12315
@@ -76,90 +78,6 @@ TOKEN_MAP = {
 # Sabotage Type Categories (Spec Section 6.2)
 LOGIC_SABOTAGE_TYPES = {"logic_code_lie", "numeric_neighbor_trap", "irrelevancy_rag", "semantic_drift"}
 NATURAL_FAILURE_TYPE = "natural"
-
-def build_prompt(
-    query:    str,
-    context:  str,
-    trace:    str,
-    statement: str,
-    tokenizer,
-    max_seq_length: int = MAX_SEQ_LENGTH,
-    # --- training-only fields (None → inference mode, no completion) ---
-    label_token: Optional[str] = None,
-    reasoning:   Optional[str] = None,
-) -> str:
-    """
-    Build a single prompt with smart context truncation and Selective Repetition.
-
-    Training mode  : pass label_token + reasoning  → full prompt + completion
-    Inference mode : leave label_token=None         → prompt stops at 'Label:'
-
-    Truncation strategy & Prompt Repetition:
-    -------------------
-    To overcome the 'lost-in-the-middle' causal attention bottleneck, we state the 
-    Task and Target at the TOP, provide the massive Context, and REPEAT the Target 
-    at the BOTTOM. Context is truncated from the END.
-    """
-    system_msg  = "<|im_start|>system\nYou are a rigorous financial auditor.<|im_end|>\n"
-    
-    # --- TOP BOOKEND ---
-    # Prime the attention heads: Tell it the task and what to look for BEFORE the massive text.
-    user_prefix = (
-        f"<|im_start|>user\n"
-        f"### TASK:\n"
-        f"Verify if the CLAIMED_ANSWER to the QUERY given the AGENT_TRACE is [Found, Fake, General] based on the EVIDENCE.\n\n"
-        f"### VERIFICATION TARGET:\n"
-        f"**Query:**\n {query}\n"
-        f"**AGENT TRACE (Methodology):**\n {trace}\n"
-        f"**Claimed Answer:**\n {statement}\n\n"
-        f"### EVIDENCE (Source Document):\n"
-    )
-    
-    # --- BOTTOM BOOKEND ---
-    # The 'Let me repeat' triggers cross-attention between the prompt and the deep KV cache.
-    user_suffix = (
-        f"\n\n### VERIFICATION TARGET Recap:\n"
-        f"**Query:**\n {query}\n"
-        f"**AGENT TRACE (Methodology):**\n {trace}\n"
-        f"**Claimed Answer:**\n {statement}\n\n"
-        f"### TASK:\n"
-        f"Is the CLAIMED_ANSWER supported by the EVIDENCE? Answer with one of: Found, Fake, General.\n"
-        f"### AUDIT ALGORITHM (CRITICAL):\n"
-        f"Do NOT recalculate the math. Assume the arithmetic in the trace evaluates to the Claimed Answer. You must verify the EXTRACTION and LOGIC:\n"
-        f"1. EXTRACTION CHECK: Are ALL specific numbers, dates, and entities used in the AGENT TRACE explicitly present in the EVIDENCE? If any number is fabricated or pulled from the wrong row/column -> Fake\n"
-        f"2. LOGIC CHECK: Does the AGENT TRACE use the correct operation and the correct metrics to answer the QUERY? If it answers the wrong question or uses the wrong year -> Fake\n"
-        f"3. AXIOM CHECK: If the EVIDENCE is irrelevant, but the Claimed Answer is a widely known universal fact -> General\n"
-        f"4. If Extraction and Logic are both supported by the EVIDENCE -> Found\n\n"
-        f"Output your label (Found, Fake, or General) first, followed by your analysis.<|im_end|>\n"
-        f"<|im_start|>assistant\nLabel:"
-    )
-
-    if label_token is not None and reasoning is not None:
-        # Training: completion is part of the sequence (Note the leading space for label_token)
-        completion = f"{label_token}\nAnalysis: {reasoning}<|im_end|>"
-    else:
-        # Inference: no completion
-        completion = ""
-
-    # ---------- budget calculation ----------
-    # We must account for the fact that the Target is duplicated in the budget
-    essential      = system_msg + user_prefix + user_suffix + completion
-    essential_toks = len(tokenizer.encode(essential, add_special_tokens=False))
-    context_budget = max_seq_length - essential_toks - 20   # 20-tok safety margin
-
-    # ---------- context truncation ----------
-    if context_budget > 50:
-        # We only encode the context, not the prefix "Context: " since that's moved to user_prefix
-        context_tokens = tokenizer.encode(context, add_special_tokens=False)
-        if len(context_tokens) > context_budget:
-            context_tokens = context_tokens[:context_budget]
-            context_text   = tokenizer.decode(context_tokens, skip_special_tokens=True) + "\n"
-        else:
-            context_text   = context + "\n"
-    else:
-        context_text = "[Truncated]\n"
-
-    return system_msg + user_prefix + context_text + user_suffix + completion
 
 def format_prompt_func(example, tokenizer, max_seq_length=MAX_SEQ_LENGTH):
     """Format with smart context truncation."""
@@ -188,6 +106,7 @@ def format_prompt_func(example, tokenizer, max_seq_length=MAX_SEQ_LENGTH):
             max_seq_length=max_seq_length,
             label_token=label_token,
             reasoning=reasoning,
+            prompt_type=PROMPT_TYPE,
         )
         output_texts.append(text)
         

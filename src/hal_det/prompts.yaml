@@ -1,0 +1,63 @@
+system_msg: |
+  <|im_start|>system
+  You are a rigorous financial auditor.<|im_end|>
+  
+user_prefix: |
+  <|im_start|>user
+  ### TASK:
+  Verify if the CLAIMED_ANSWER to the QUERY given the AGENT_TRACE is [Found, Fake, General] based on the EVIDENCE.
+  
+  ### VERIFICATION TARGET:
+  **Query:**
+   {query}
+  **AGENT TRACE (Methodology):**
+   {trace}
+  **Claimed Answer:**
+   {statement}
+  
+  ### EVIDENCE (Source Document):
+  
+user_suffix:
+  full: |-
+    
+    
+    ### VERIFICATION TARGET Recap:
+    **Query:**
+     {query}
+    **AGENT TRACE (Methodology):**
+     {trace}
+    **Claimed Answer:**
+     {statement}
+    
+    ### TASK:
+    Is the CLAIMED_ANSWER supported by the EVIDENCE? Answer with one of: Found, Fake, General.
+    ### AUDIT ALGORITHM (CRITICAL):
+    Do NOT recalculate the math. Assume the arithmetic in the trace evaluates to the Claimed Answer. You must verify the EXTRACTION and LOGIC:
+    1. EXTRACTION CHECK: Are ALL specific numbers, dates, and entities used in the AGENT TRACE explicitly present in the EVIDENCE? If any number is fabricated or pulled from the wrong row/column -> Fake
+    2. LOGIC CHECK: Does the AGENT TRACE use the correct operation and the correct metrics to answer the QUERY? If it answers the wrong question or uses the wrong year -> Fake
+    3. AXIOM CHECK: If the EVIDENCE is irrelevant, but the Claimed Answer is a widely known universal fact -> General
+    4. If Extraction and Logic are both supported by the EVIDENCE -> Found
+    
+    Output your label (Found, Fake, or General) first, followed by your analysis.<|im_end|>
+    <|im_start|>assistant
+    Label:
+  noinstruct: |-
+    
+    
+    ### VERIFICATION TARGET Recap:
+    **Query:**
+     {query}
+    **AGENT TRACE (Methodology):**
+     {trace}
+    **Claimed Answer:**
+     {statement}
+    
+    ### TASK:
+    Is the CLAIMED_ANSWER supported by the EVIDENCE? Answer with one of: Found, Fake, General.
+    ### INSTRUCTIONS
+    1.1. Claim is supported and accurate -> Found
+    1.2. Claim violates evidence or wrong -> Fake
+    1.3. Claim is not verifiable from the EVIDENCE but is a widely world knowledge -> General
+    2. Output label (Found, Fake, or General) first, followed by your analysis.<|im_end|>
+    <|im_start|>assistant
+    Label:
