@@ -1,7 +1,7 @@
 import pytest
 import os
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 from venra.navigator import Navigator
 from venra.models import RetrievalPlan
 
@@ -37,8 +37,9 @@ async def test_navigator_generates_plan(mock_schema_file):
     
     with patch("venra.navigator.instructor.from_openai") as mock_init:
         mock_client = MagicMock()
-        mock_init.return_value = mock_client
+        mock_client.chat.completions.create = AsyncMock()
         mock_client.chat.completions.create.return_value = mock_plan
+        mock_init.return_value = mock_client
         
         nav = Navigator(api_key="fake", schema_path=mock_schema_file)
         plan = await nav.navigate("What were TransDigm's sales in 2023?")
@@ -53,17 +54,19 @@ async def test_navigator_generates_plan(mock_schema_file):
         assert "Net Sales" in system_msg
 
 @pytest.mark.asyncio
-async def test_navigator_fallback_on_error(mock_schema_file):
+async def test_navigator_raises_on_error(mock_schema_file):
     """
-    Test that Navigator returns a fallback plan if the LLM call fails.
+    Test that Navigator retries and then raises an Exception if the LLM call fails completely.
     """
     with patch("venra.navigator.instructor.from_openai") as mock_init:
-        mock_client = MagicMock()
-        mock_init.return_value = mock_client
-        mock_client.chat.completions.create.side_effect = Exception("API Error")
-        
-        nav = Navigator(api_key="fake", schema_path=mock_schema_file)
-        plan = await nav.navigate("Some query")
-        
-        assert plan.ufl_query is None
-        assert "Navigation error" in plan.reasoning
+        # Patch sleep to make tenacity retries instantaneous
+        with patch("asyncio.sleep", return_value=None):
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = AsyncMock(side_effect=Exception("API Error"))
+            mock_init.return_value = mock_client
+            
+            nav = Navigator(api_key="fake", schema_path=mock_schema_file)
+            
+            with pytest.raises(Exception, match="API Error"):
+                await nav.navigate("Some query")
+

@@ -1,8 +1,22 @@
 import json
 import os
+import re
 from typing import List, Dict, Any
 from venra.models import UFLRow, EntityMetadata
 from venra.logging_config import logger
+
+def is_numeric_metric(name: str) -> bool:
+    """
+    Returns True if the metric name appears to be just a number or noise.
+    Matches: "$ 12657", "(1,757)", "2.35", "-6781", "100", "\u00a3 500", etc.
+    Rule: A valid semantic metric name MUST contain at least one alphabetic character (a-z, A-Z).
+    """
+    if not name:
+        return True
+    # If there are no letters, it's probably just a value or currency noise
+    if not re.search(r'[a-zA-Z]', name):
+        return True
+    return False
 
 class SchemaGenerator:
     """
@@ -25,6 +39,8 @@ class SchemaGenerator:
 
     def add_rows(self, rows: List[UFLRow]):
         for row in rows:
+            if is_numeric_metric(row.metric_name):
+                continue
             # Track metric frequency
             self.metrics[row.metric_name] = self.metrics.get(row.metric_name, 0) + 1
 

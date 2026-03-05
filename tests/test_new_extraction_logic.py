@@ -256,8 +256,14 @@ async def test_multi_pass_extraction_dedup_first_pass_wins():
     synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
     mock_single_pass = AsyncMock(side_effect=[pass1_facts, pass2_facts, pass3_facts])
 
+    def mock_align_func(facts, **kwargs):
+        for f in facts:
+            f.alignment_status = "EXACT"
+            f.alignment_confidence = 1.0
+        return facts
+
     with patch.object(synthesizer, "_single_pass", new=mock_single_pass):
-        with patch.object(synthesizer._aligner, "align", side_effect=lambda f, **kw: f):
+        with patch.object(synthesizer._aligner, "align", side_effect=mock_align_func):
             rows = await synthesizer.extract_facts(block)
 
     metric_names = [r.metric_name for r in rows]

@@ -1,7 +1,7 @@
 import pytest
 import pandas as pd
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 from venra.models import DocBlock, BlockType, EntityMetadata, TableBlock, UFLRow, TextBlock, FactExtractionResponse, ScrapedFact
 from venra.synthesis import EntityResolver, TableMelter, TextSynthesizer, ContextIndexer
 
@@ -243,18 +243,24 @@ async def test_text_synthesizer_relationships():
     )
     
     # Mock OpenAI client used in TextSynthesizer._single_pass
-    with patch("venra.synthesis.OpenAI") as mock_openai_init:
-        mock_client = MagicMock()
+    with patch("venra.synthesis.AsyncOpenAI") as mock_openai_init:
+        mock_client = AsyncMock()
         mock_openai_init.return_value = mock_client
         
         # Mock completion response
         mock_choice = MagicMock()
-        mock_choice.message.content = '{"facts": [' + mock_fact.model_dump_json() + ']}'
+        mock_choice.message.content = '{"facts": [ ' + mock_fact.model_dump_json() + ']}'
         mock_client.chat.completions.create.return_value.choices = [mock_choice]
         
-        # Also mock the aligner to return the same facts
-        with patch("venra.synthesis.PostHocAligner.align", side_effect=lambda f, **kw: f):
-            synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        # Ensure aligner returns fact with high confidence
+        def mock_align(facts, **kw):
+            for f in facts:
+                f.alignment_status = "EXACT"
+                f.alignment_confidence = 1.0
+            return facts
+
+        with patch.object(synthesizer._aligner, "align", side_effect=mock_align):
             rows = await synthesizer.extract_facts(block)
             
             row = rows[0]
@@ -326,16 +332,22 @@ async def test_text_synthesizer_inequalities():
         confidence=0.9
     )
     
-    with patch("venra.synthesis.OpenAI") as mock_openai_init:
-        mock_client = MagicMock()
+    with patch("venra.synthesis.AsyncOpenAI") as mock_openai_init:
+        mock_client = AsyncMock()
         mock_openai_init.return_value = mock_client
         
         mock_choice = MagicMock()
         mock_choice.message.content = '{"facts": [' + mock_fact.model_dump_json() + ']}'
         mock_client.chat.completions.create.return_value.choices = [mock_choice]
         
-        with patch("venra.synthesis.PostHocAligner.align", side_effect=lambda f, **kw: f):
-            synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        def mock_align(facts, **kw):
+            for f in facts:
+                f.alignment_status = "EXACT"
+                f.alignment_confidence = 1.0
+            return facts
+
+        with patch.object(synthesizer._aligner, "align", side_effect=mock_align):
             rows = await synthesizer.extract_facts(block)
             
             row = rows[0]
@@ -362,16 +374,22 @@ async def test_text_synthesizer_basis_points():
         confidence=0.95
     )
     
-    with patch("venra.synthesis.OpenAI") as mock_openai_init:
-        mock_client = MagicMock()
+    with patch("venra.synthesis.AsyncOpenAI") as mock_openai_init:
+        mock_client = AsyncMock()
         mock_openai_init.return_value = mock_client
         
         mock_choice = MagicMock()
         mock_choice.message.content = '{"facts": [' + mock_fact.model_dump_json() + ']}'
         mock_client.chat.completions.create.return_value.choices = [mock_choice]
         
-        with patch("venra.synthesis.PostHocAligner.align", side_effect=lambda f, **kw: f):
-            synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        def mock_align(facts, **kw):
+            for f in facts:
+                f.alignment_status = "EXACT"
+                f.alignment_confidence = 1.0
+            return facts
+
+        with patch.object(synthesizer._aligner, "align", side_effect=mock_align):
             rows = await synthesizer.extract_facts(block)
             
             assert rows[0].num_value == 120.0
@@ -407,16 +425,22 @@ async def test_graph_relationship_extraction():
         confidence=1.0
     )
     
-    with patch("venra.synthesis.OpenAI") as mock_openai_init:
-        mock_client = MagicMock()
+    with patch("venra.synthesis.AsyncOpenAI") as mock_openai_init:
+        mock_client = AsyncMock()
         mock_openai_init.return_value = mock_client
         
         mock_choice = MagicMock()
         mock_choice.message.content = '{"facts": [' + fact1.model_dump_json() + ', ' + fact2.model_dump_json() + ']}'
         mock_client.chat.completions.create.return_value.choices = [mock_choice]
         
-        with patch("venra.synthesis.PostHocAligner.align", side_effect=lambda f, **kw: f):
-            synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        synthesizer = TextSynthesizer(entity_id="ID_TEST", api_key="fake")
+        def mock_align(facts, **kw):
+            for f in facts:
+                f.alignment_status = "EXACT"
+                f.alignment_confidence = 1.0
+            return facts
+
+        with patch.object(synthesizer._aligner, "align", side_effect=mock_align):
             rows = await synthesizer.extract_facts(block)
             
             assert len(rows) == 2
@@ -425,3 +449,67 @@ async def test_graph_relationship_extraction():
             assert "Champion Aerospace" in rows[0].text_nuance
             assert rows[0].related_entity_id is None
             assert rows[0].num_value is None
+
+# ==========================================
+# Feature: Performance Table Pivot (Bug C Fix)
+# ==========================================
+
+def test_performance_table_orientation():
+    """
+    Test that performance tables (entities in first column) are correctly 
+    pivoted into semantically rich metric names.
+    """
+    melter = TableMelter(entity_id="ID_STT", entity_name_raw="State Street")
+    
+    # Table from STT 2012 example
+    # First column is entities, headers are years.
+    table_content = """|  | 2007 | 2008 | 2009 |
+| --- | --- | --- | --- |
+| State Street Corporation | $ 100 | 71.55 | 65.55 |
+| S&P 500 Index | 100 | 63.00 | 80.00 |
+"""
+    
+    block = TableBlock(
+        content=table_content,
+        section_path=["Experiment", "financebench", "STT"],
+    )
+    
+    rows = melter.melt(block)
+    
+    # We expect 2 entities * 3 years = 6 rows
+    assert len(rows) == 6
+    
+    ss_2007 = next(r for r in rows if r.related_entity_id == "State Street Corporation" and r.period_end == "2007")
+    
+    # Check that metric name is the entity name (since header is a year)
+    assert ss_2007.metric_name == "State Street Corporation"
+    assert ss_2007.num_value == 100.0
+    assert ss_2007.related_entity_id == "State Street Corporation"
+
+def test_performance_table_with_generic_header():
+    """
+    Test table where headers are generic metrics like 'Value' or '$ 100'.
+    """
+    melter = TableMelter(entity_id="ID_TEST")
+    
+    table_content = """| Company | $ 100 | Return % |
+| --- | --- | --- |
+| Pfizer Inc | 120 | 5.2 |
+| Moderna Corp | 150 | 10.1 |
+"""
+    block = TableBlock(
+        content=table_content,
+        section_path=["Acquisitions"],
+    )
+    
+    rows = melter.melt(block)
+    
+    # Pfizer $ 100 row
+    pfe_val = next(r for r in rows if r.related_entity_id == "Pfizer Inc" and "$ 100" in r.metric_name)
+    assert pfe_val.metric_name == "$ 100 of Pfizer Inc"
+    assert pfe_val.num_value == 120.0
+    
+    # Pfizer Return % row
+    pfe_ret = next(r for r in rows if r.related_entity_id == "Pfizer Inc" and "Return %" in r.metric_name)
+    assert pfe_ret.metric_name == "Return % of Pfizer Inc"
+    assert pfe_ret.num_value == 5.2

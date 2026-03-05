@@ -79,12 +79,20 @@ class ContextAssembler:
         return top_chunks
 
     def _deduplicate_rows(self, rows: List[UFLRow]) -> List[UFLRow]:
-        seen_ids = set()
+        """
+        Deduplicate rows by content key to prevent redundant identical facts
+        from cluttering the agent prompt. 
+        Key: (entity, metric, period_end, value)
+        """
+        seen_keys = set()
         unique = []
         for r in rows:
-            if r.row_id not in seen_ids:
+            # BUG 6 FIX: Collapse identical facts even if they have different row_ids
+            # Use a tuple of stable fields as the uniqueness key.
+            key = (r.canonical_entity_id, r.metric_name, r.period_end, r.num_value)
+            if key not in seen_keys:
                 unique.append(r)
-                seen_ids.add(r.row_id)
+                seen_keys.add(key)
         return unique
 
     def _deduplicate_chunks(self, chunks: List[DocBlock]) -> List[DocBlock]:

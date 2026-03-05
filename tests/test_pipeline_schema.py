@@ -3,8 +3,28 @@ import pytest
 import json
 from unittest.mock import MagicMock, patch
 from venra.pipeline import IngestionPipeline
-from venra.schema import SchemaGenerator
+from venra.schema import SchemaGenerator, is_numeric_metric
 from venra.models import DocBlock, BlockType, EntityMetadata, UFLRow, FactExtractionResponse
+
+def test_is_numeric_metric():
+    # Noise/Numbers that SHOULD be dropped (return True)
+    assert is_numeric_metric("$ 12657") is True
+    assert is_numeric_metric("(1,757)") is True
+    assert is_numeric_metric("2.35") is True
+    assert is_numeric_metric("-6781") is True
+    assert is_numeric_metric("100") is True
+    assert is_numeric_metric("\u00a3 500") is True
+    assert is_numeric_metric("$ (0.96)") is True
+    assert is_numeric_metric("---") is True
+    assert is_numeric_metric("12.5%") is True
+    
+    # Valid semantic metrics that SHOULD NOT be dropped (return False)
+    assert is_numeric_metric("Revenue") is False
+    assert is_numeric_metric("Net Income") is False
+    assert is_numeric_metric("Gross Margin (%)") is False
+    assert is_numeric_metric("Research & Development") is False
+    assert is_numeric_metric("Operating Lease, Liability") is False
+    assert is_numeric_metric("Total Assets 2023") is False
 
 @pytest.fixture
 def mock_blocks():
@@ -86,11 +106,12 @@ def test_schema_generator_logic():
     )
     gen.add_entity(entity)
     
-    # Add dummy rows
+    # Add dummy rows (including a noisy numeric one)
     rows = [
         UFLRow(row_id="1", canonical_entity_id="ID_TEST", metric_name="Revenue", grounding_quote="dummy", num_value=100.0, period_start="2023", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence_score=1.0),
         UFLRow(row_id="2", canonical_entity_id="ID_TEST", metric_name="Revenue", grounding_quote="dummy", num_value=110.0, period_start="2022", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence_score=1.0),
         UFLRow(row_id="3", canonical_entity_id="ID_TEST", metric_name="EBITDA", grounding_quote="dummy", num_value=20.0, period_start="2023", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence_score=1.0),
+        UFLRow(row_id="4", canonical_entity_id="ID_TEST", metric_name="$ 12345", grounding_quote="dummy", num_value=12345.0, period_start="2023", source_chunk_id="c1", entity_name_raw="Test", doc_section="Financials", confidence_score=1.0),
     ]
     gen.add_rows(rows)
     
@@ -100,5 +121,8 @@ def test_schema_generator_logic():
     
     assert "Revenue" in top_metrics
     assert "EBITDA" in top_metrics
+    assert "$ 12345" not in top_metrics
     assert gen.metrics["Revenue"] == 2
     assert gen.metrics["EBITDA"] == 1
+    assert "$ 12345" not in gen.metrics
+    

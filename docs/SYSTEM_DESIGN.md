@@ -99,9 +99,13 @@ We move from "Retrieving Text" to "Retrieving Variables." We replace probabilist
 
 ## 3. Evaluation Methodology
 
-1.  **Hallucination Rate (Numerical):** % of answers where the calculated number deviates from Ground Truth.
-2.  **Retrieval Precision:** Did the "Semantic Schema Search" find the right column? (e.g., finding "Obligations" when asked for "Debt").
-3.  **Judge Accuracy:** How well does the SLM Proxy correlate with human labels of hallucination?
+1.  **Hallucination Rate (Numerical):** Percentage of answers containing at least one number in the reasoning trace not found in source context. whitelisted correct answers are 0%. Measured across the *complete reasoning trace* (CoT/PAL) with automated markdown-code hygiene.
+2.  **Retrieval Precision:** Did the "Semantic Schema Search" find the right column? Includes **Navigator Rescue Rate** to measure hypothesis-driven retrieval recovery.
+3.  **Scientific Failure Taxonomy [NEW]:** Programmatically categorizes failures into 7 distinct types (T0-T6) to isolate root causes:
+    *   **Retrieval vs. Coverage:** Distinguishes between failed search algorithms (`TYPE_1`) and data missing from the index (`TYPE_5_COVERAGE_GAP`).
+    *   **Generative vs. Grounded Refusal:** Recognizes correct "Data not found" refusals as grounded behavior, preventing false `TYPE_2` penalties.
+    *   **Label Noise:** Accounts for interpretive benchmark labels via `TYPE_6_GOLD_AMBIGUITY`.
+4.  **Judge Accuracy:** How well does the SLM Proxy correlate with human labels of hallucination?
 
 ---
 

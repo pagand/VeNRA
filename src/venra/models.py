@@ -84,10 +84,11 @@ class UFLRow(BaseModel):
         None,
         description="Pure float after scale applied. None/NaN for qualitative facts.",
     )
-    grounding_quote: str = Field(
+    grounding_quote: Optional[str] = Field(
         default="",
         description=(
-            "Constructed by PostHocAligner. Verbatim substring from the text that justifies this fact."
+            "Constructed by PostHocAligner. Verbatim substring from the text that justifies this fact. "
+            "Can be None if alignment fails or if the SLM provides no quote."
         ),
     )
     unit_normalized: str = Field(
@@ -121,6 +122,10 @@ class UFLRow(BaseModel):
     source_chunk_id: str = Field(
         ...,
         description="Foreign key → ChromaDB text chunk containing this fact.",
+    )
+    source_record_id: Optional[str] = Field(
+        default=None,
+        description="Original source record ID (e.g. 'finqa_CME/2012/page_73.pdf') for doc-id scoping fallback.",
     )
 
     # --- Nuance & Qualitative Fallback ---
@@ -189,11 +194,12 @@ class ScrapedFact(BaseModel):
             "Do NOT include commas, currency symbols, or scale words."
         ),
     )
-    grounding_quote: str = Field(
+    grounding_quote: Optional[str] = Field(
         default="",
         description=(
-            "REQUIRED. The exact verbatim text snippet from the source as it appeared "
-            "(e.g. '$2.4 billion', '(345)', 'substantially all'). Used for alignment verification."
+            "The exact verbatim text snippet from the source as it appeared "
+            "(e.g. '$2.4 billion', '(345)', 'substantially all'). Used for alignment verification. "
+            "Can be None if the fact is purely qualitative or if the model fails to extract a quote."
         ),
     )
 
@@ -286,7 +292,7 @@ class UFLFilter(BaseModel):
     )
     years: List[str] = Field(
         ...,
-        description="Specific years mentioned (e.g. ['2023', '2022']). Empty for 'current'/'trend'.",
+        description="Specific years mentioned in the query (e.g. ['2019', '2020']). Set to an empty list [] if no specific year is requested or if the query is a trend.",
     )
     nuance_focus: Optional[str] = Field(
         None,

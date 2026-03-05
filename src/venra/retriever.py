@@ -56,7 +56,7 @@ from venra.logging_config import logger
 # Tuning constants
 # ---------------------------------------------------------------------------
 
-LEXICAL_OVERLAP_THRESHOLD: float = 0.30
+LEXICAL_OVERLAP_THRESHOLD: float = 0.20
 
 # Strips the [Previous Context: ...]\n\n prefix injected by Phase 2 ingestion.
 _PREV_CONTEXT_RE = re.compile(r"^\[Previous Context:[^\]]*\]\s*", re.DOTALL)
@@ -192,6 +192,7 @@ class DualRetriever:
         k: int = 4,
         include_all_chunks_for_ufl: bool = True,
         include_all_ufl_for_chunks: bool = True,
+        doc_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Dual retrieval with Relational Expansion and Lexical Pre-Filtering.
@@ -230,12 +231,22 @@ class DualRetriever:
         for c in keyword_chunks:
             chunk_id_map.setdefault(c.id, c)
 
+        # BUG 3 FIX: Toggle first_pass_miss if vector search failed to find ANY chunks
+        first_pass_miss = (len(chunk_id_map) == 0)
+
         # 2. Direct UFL query
+        ufl_query = plan.ufl_query
         selected_ufl_rows = (
-            self._query_ufl(plan.ufl_query, combined_query_tokens)
-            if plan.ufl_query
+            self._query_ufl(ufl_query, combined_query_tokens, doc_id_scope=doc_id)
+            if ufl_query
             else []
         )
+        
+        # BUG 2 FIX: Cap UFL results to prevent context inflation (Production Rule §4)
+        if len(selected_ufl_rows) > 10:
+            logger.warning(f"UFL result set too large ({len(selected_ufl_rows)}). Capping to 10.")
+            selected_ufl_rows = selected_ufl_rows[:10]
+
         row_id_map: Dict[str, UFLRow] = {r.row_id: r for r in selected_ufl_rows}
 
         # 3. Expansion A — related entity pivoting
@@ -268,16 +279,43 @@ class DualRetriever:
                     chunk_id_map[cid] = expanded[0]
 
         # 3. Expansion C — Chunk → UFL (completeness, bypasses gate)
+        # BUG 4 FIX: Scope expansion to doc_id to avoid multi-record contamination.
         if include_all_ufl_for_chunks and chunk_id_map:
             current_chunk_ids = list(chunk_id_map.keys())
             if not self.df.empty and "source_chunk_id" in self.df.columns:
-                expanded_rows = self.df[self.df["source_chunk_id"].isin(current_chunk_ids)]
+                # FIX: Handle sub-chunk suffixes (e.g. {parent_id}_f820)
+                # We strip the suffix from the UFL column before matching against ChromaDB parent IDs.
+                ufl_source_ids = self.df["source_chunk_id"].astype(str)
+                base_source_ids = ufl_source_ids.str.replace(r"_[0-9a-f]{4}$", "", regex=True)
+                expanded_rows = self.df[base_source_ids.isin(current_chunk_ids)]
+                
+                if doc_id:
+                    expanded_rows = expanded_rows[expanded_rows["source_record_id"] == doc_id]
+                
                 for _, er in expanded_rows.iterrows():
                     row_obj = UFLRow(**er.to_dict())
                     row_id_map.setdefault(row_obj.row_id, row_obj)
 
         final_rows = list(row_id_map.values())
         final_chunks = list(chunk_id_map.values())
+
+        # BUG 2 & BUG 4 FIX: Detect UFL Bleed (Type 0 failure) on FINAL results
+        ufl_bleed = False
+        if final_rows:
+            found_entities = {r.canonical_entity_id for r in final_rows}
+            if plan.ufl_query and plan.ufl_query.entity_ids:
+                if any(eid not in plan.ufl_query.entity_ids for eid in found_entities):
+                    ufl_bleed = True
+            elif len(found_entities) > 1:
+                ufl_bleed = True
+                
+            # BUG 4: Scoping precision validation
+            if doc_id:
+                if any(r.source_record_id != doc_id for r in final_rows if r.source_record_id):
+                    ufl_bleed = True
+        
+        if ufl_bleed:
+             logger.error("UFL Bleed detected: results contain multiple or unrelated entities/records.")
 
         logger.info(
             f"Retrieval complete: {len(final_rows)} UFL rows, "
@@ -291,6 +329,8 @@ class DualRetriever:
                 "ufl_count": len(final_rows),
                 "text_count": len(final_chunks),
                 "vector_keywords": plan.vector_keywords,
+                "first_pass_miss": first_pass_miss,
+                "ufl_bleed": ufl_bleed,
             },
         }
 
@@ -339,24 +379,34 @@ class DualRetriever:
         self,
         filter_spec: Any,
         query_tokens: Optional[List[str]] = None,
+        doc_id_scope: Optional[str] = None,
     ) -> List[UFLRow]:
         """
         Query the UFL DataFrame applying entity, year, metric, and nuance_focus
         filters in sequence.
-
-        nuance_focus behaviour:
-          When UFLFilter.nuance_focus is set (e.g. "Restated"), only rows whose
-          text_nuance contains that string (case-insensitive) are returned. Rows
-          with NULL/NaN text_nuance are excluded. This is an AND-narrowing filter:
-          it assumes the Navigator has determined the query requires nuanced rows.
         """
         if self.df.empty:
             return []
 
         mask = pd.Series(True, index=self.df.index)
 
-        if filter_spec.entity_ids:
+        # Ensure we never return explicitly hallucinated rows that failed grounding
+        if "alignment_status" in self.df.columns:
+            mask &= self.df["alignment_status"] != "UNALIGNED"
+
+        if filter_spec.entity_ids and doc_id_scope and "source_record_id" in self.df.columns:
+            # FIX: Robust fallback for ticker mismatches (e.g. ID_VZ vs ID_VERIZON)
+            # If we have a doc_id_scope, we accept rows that match the entity OR the record.
+            # This ensures that even if the Navigator picks a slightly different entity ID,
+            # the primary record's data is still retrieved.
+            entity_mask = self.df["canonical_entity_id"].isin(filter_spec.entity_ids)
+            record_mask = self.df["source_record_id"] == doc_id_scope
+            mask &= (entity_mask | record_mask)
+        elif filter_spec.entity_ids:
             mask &= self.df["canonical_entity_id"].isin(filter_spec.entity_ids)
+        elif doc_id_scope and "source_record_id" in self.df.columns:
+            # BUG 2 & 4: True record-scoping fallback logic
+            mask &= self.df["source_record_id"] == doc_id_scope
 
         if filter_spec.years:
             year_pattern = "|".join(filter_spec.years)
@@ -369,13 +419,14 @@ class DualRetriever:
                 mask &= self.df[period_col].astype(str).str.contains(
                     year_pattern, na=False
                 )
+        # BUG 5 FIX: treat empty years as all years (already true because mask not updated)
 
         if filter_spec.metric_keywords:
             exact_mask = self.df["metric_name"].isin(filter_spec.metric_keywords)
 
             if not exact_mask.any():
                 pattern = "|".join(
-                    f"(?i).*{re.escape(m)}.*" for m in filter_spec.metric_keywords
+                    f".*{re.escape(m)}.*" for m in filter_spec.metric_keywords
                 )
                 fuzzy_mask = self.df["metric_name"].str.contains(
                     pattern, case=False, na=False, regex=True
