@@ -143,12 +143,11 @@ def normalize_numeric(text: str) -> List[str]:
     }
 
     # Replace comma separators and currency symbols
-    text = text.replace("$", "").replace(",", "").replace("%", "")
+    text = text.replace("$", " ").replace(",", "").replace("%", " ")
 
-    # Find numbers with optional scale suffixes
-    # pattern uses \b at start and (?![.\d]) lookahead to ensure we consume
-    # the FULL numeric component before checking for a scale suffix.
-    pattern = r"\b(-?\d+\.?\d*)(?![.\d])\s*(million|billion|trillion|mn|bn|tn|m|b|t)?\b"
+    # Find numbers with optional scale suffixes.
+    # We remove the leading \b to allow matching numbers after pipes or currency.
+    pattern = r"(-?\d+\.?\d*)(?![.\d])\s*(million|billion|trillion|mn|bn|tn|m|b|t)?\b"
     matches = re.findall(pattern, text)
 
     out = set()
@@ -408,6 +407,7 @@ def get_failure_type(
     code_executed: bool = False,
     coverage_gap: bool = False,
     source_ds: str = "unknown",
+    is_self_aware_warning: bool = False,
 ) -> str:
     """
     VeNRA Failure Taxonomy:
@@ -438,9 +438,6 @@ def get_failure_type(
              # and gold is something like "Digital, Webzone" (names)
              return "TYPE_6_GOLD_AMBIGUITY"
 
-    if ufl_bleed:
-        return "TYPE_0_UFL_BLEED"
-    
     # Issue 1 & 2 Fix: Prioritize Coverage Gap over Retrieval Blindness
     if coverage_gap:
         return "TYPE_5_COVERAGE_GAP"
@@ -455,16 +452,41 @@ def get_failure_type(
     if not is_numeric and run_id in ("run_3", "run_4") and code_executed:
         return "TYPE_4_MODALITY_MISMATCH"
 
+    # Pre-calculate refusal status for causal guards
+    refusals = ["not available", "no information", "cannot answer", "not found", "insufficient", "does not mention", "does not state", "not in context"]
+    is_refusal = any(r in predicted.lower() for r in refusals) or is_self_aware_warning
+
     if is_numeric:
+        # REFUSAL GUARD: If model said 'not found', it's a retrieval blindness (T1)
+        # even if it's a numeric query. It didn't conflate; it just didn't see.
+        if is_refusal:
+            return "TYPE_1_RETRIEVAL_BLINDNESS"
+
         context_nums = set(normalize_numeric(retrieved_context))
         if set(gold_nums).issubset(context_nums):
-            return "TYPE_2_GENERATIVE_CONFLATION"
-        return "TYPE_3_ARITHMETIC_HALLUCINATION"
+            # We found all the gold numbers in context, but EM is False.
+            # This is arithmetic failure (T3).
+            return "TYPE_3_ARITHMETIC_HALLUCINATION"
+        
+        # Causal T0 Check: Did the bleed actually cause the error?
+        # Only assign T0 if: 
+        # 1. Bleed was present 
+        # 2. Model did NOT refuse (it tried to answer)
+        # 3. PAL didn't run (or failed) 
+        # 4. We match a UFL distractor number.
+        if ufl_bleed and not is_refusal and not code_executed:
+            # Extract numbers ONLY from the UFL table section of the context
+            ufl_section = retrieved_context.split("# SOURCE TEXT CHUNKS")[0]
+            ufl_nums = set(normalize_numeric(ufl_section))
+            pred_nums = set(normalize_numeric(predicted))
+            if pred_nums.intersection(ufl_nums):
+                return "TYPE_0_UFL_BLEED"
 
-    # Issue 2 Fix: For qualitative queries, check for explicit refusal.
-    # If the model correctly identifies missing info, it's not "Generative Conflation".
-    refusals = ["not available", "no information", "cannot answer", "not found", "insufficient", "does not mention", "does not state"]
-    if any(r in predicted.lower() for r in refusals):
+        # If it wasn't a proven T0, it's a T2 (Generative Conflation)
+        return "TYPE_2_GENERATIVE_CONFLATION"
+
+    # Qualitative queries
+    if is_refusal:
         return "TYPE_1_RETRIEVAL_BLINDNESS"
 
     # For qualitative queries where retrieval was OK but EM is False
@@ -699,7 +721,10 @@ class MetricExtractor:
                     if (run_id in ("run_3", "run_4") and has_logic) else None
                 )
 
-                # BUG F FIX: pass code_success to get_failure_type
+                # NEW: Extract self-awareness flag for causal guards
+                is_warn = run_data.get("full_response", {}).get("is_self_aware_warning", False)
+
+                # BUG F FIX: pass code_success and self-aware flag to get_failure_type
                 ftype = get_failure_type(
                     em, ret_ok, run_data["answer"], ret_ctx, golden_answer,
                     ufl_bleed=(venra_ufl_bleed if ret_type == "venra" else False),
@@ -707,6 +732,7 @@ class MetricExtractor:
                     code_executed=bool(code_success),
                     coverage_gap=coverage_gap,
                     source_ds=sample.get("source_ds", "unknown"),
+                    is_self_aware_warning=is_warn,
                 )
 
                 # FIX (Full Trace Audit): Extract raw_text from full_response
@@ -727,6 +753,12 @@ class MetricExtractor:
                     pred_val=pred_val,
                     query=query,
                 )
+                
+                # PURITY FIX: If retrieval failed (T1), the model had no chance.
+                # Don't penalise hallucination rate for blind runs; it conflates
+                # retrieval failure with generative reliability.
+                if not ret_ok:
+                    h_rate = 0.0
 
                 run_stats[run_id] = {
                     "em":               em,

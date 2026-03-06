@@ -112,7 +112,7 @@ class ContextAssembler:
         df = pd.DataFrame([r.model_dump() for r in rows])
         
         # Select and reorder columns for clarity in prompt
-        cols = ['row_id', 'metric_name', 'value', 'unit', 'period', 'nuance_note', 'source_chunk_id']
+        cols = ['row_id', 'metric_name', 'num_value', 'unit_normalized', 'period_end', 'nuance_note', 'source_chunk_id']
         # Filter for only existing columns to avoid errors
         cols = [c for c in cols if c in df.columns]
         

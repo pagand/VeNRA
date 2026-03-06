@@ -16,6 +16,40 @@ URL_TEST_PARQUET = "https://huggingface.co/datasets/PatronusAI/financebench-test
 OUTPUT_PATH = "data/golden_records/financebench_normalized.jsonl"
 
 # ==========================================
+# HELPER: COMPANY EXTRACTION (FinanceBench-Test)
+# ==========================================
+KNOWN_COMPANIES = [
+    "3M", "CVS Health", "Oracle", "MGM Resorts", "Apple", "Johnson & Johnson", 
+    "Activision Blizzard", "NIKE", "American Water Works", "Pfizer", "Wal-Mart", 
+    "Corning", "Best Buy", "Verizon", "Home Depot", "Costco", "Target", "Intel",
+    "Microsoft", "Amazon", "Alphabet", "Google", "Facebook", "Meta", "Tesla",
+    "JPMorgan", "Bank of America", "Wells Fargo", "Citigroup", "Goldman Sachs",
+    "Morgan Stanley", "Visa", "Mastercard", "PayPal", "Disney", "Netflix",
+    "Comcast", "AT&T", "T-Mobile", "Sprint", "Verizon", "Chevron", "ExxonMobil",
+    "ConocoPhillips", "Boeing", "Lockheed Martin", "General Dynamics", "Northrop Grumman",
+    "Raytheon", "Caterpillar", "Deere", "General Electric", "Honeywell", "3M",
+    "Procter & Gamble", "Unilever", "Colgate-Palmolive", "Kimberly-Clark",
+    "Coca-Cola", "PepsiCo", "McDonald's", "Starbucks", "Yum! Brands", "Dominos",
+    "Chipotle", "Nike", "Adidas", "Under Armour", "Lululemon", "VF Corporation",
+    "Gap", "Levi Strauss", "Macy's", "Kohl's", "Nordstrom", "JCPenney", "Sears",
+    "Kmart", "Walmart", "Target", "Costco", "Sam's Club", "BJ's Wholesale",
+    "Walgreens", "Rite Aid", "CVS", "PGE", "PG&E"
+]
+
+def extract_company(text: str) -> str:
+    """
+    Heuristic extraction of company names from FinanceBench text snippets.
+    Used to repair the missing 'company' metadata in the test split.
+    """
+    for comp in KNOWN_COMPANIES:
+        if comp.lower() in text.lower():
+            # Canonicalise common variations
+            if comp.lower() == "cvs": return "CVS Health"
+            if comp.lower() == "pge": return "PG&E"
+            return comp
+    return "Global_Entity"
+
+# ==========================================
 # HELPER: PROMPT PARSING (Specific to FinanceBench-Test)
 # ==========================================
 def parse_financebench_prompt(prompt_text: str) -> Dict[str, str]:
@@ -232,6 +266,12 @@ class FinanceBenchNormalizer:
             # print(f"Failed to parse prompt for row {row.get('_id')}")
             return None
 
+        # 4. Extract Company (New Repair Logic)
+        company = extract_company(extracted['question'])
+        if company == "Global_Entity":
+            # Fallback to scanning the context snippet
+            company = extract_company(extracted['context'][:500])
+
         return {
             "id": f"finbench_test_{row.get('_id', str(uuid.uuid4())[:8])}",
             "dataset_source": "financebench_test",
@@ -251,7 +291,8 @@ class FinanceBenchNormalizer:
                 "sabotage_ready": sabotage_ready,
                 "original_split": "test_failure" if venra_label == "Unfounded" else "test_success",
                 "original_label": raw_label,
-                "original_reasoning": original_reasoning
+                "original_reasoning": original_reasoning,
+                "company": company
             }
         }
 

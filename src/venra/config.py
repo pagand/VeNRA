@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     @property
     def GROQ_KEYS(self) -> List[str]:
-        key_names = ["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3", "GROQ_API_KEY_4", "GROQ_API_KEY_5", "GROQ_API_KEY_6", "GROQ_API_KEY_7", "GROQ_API_KEY_8"]
+        key_names = ["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3", "GROQ_API_KEY_8"]
         keys = [os.getenv(k) for k in key_names if os.getenv(k)]
         if not keys and self.GROQ_API_KEY:
             keys = [self.GROQ_API_KEY]

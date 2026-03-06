@@ -769,7 +769,7 @@ CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
                 run_1 = run_2 = run_3 = run_4 = timeout_resp
 
             record = {
-                "sample_info": sample,
+                "sample_info": {**sample, "company": sample.get("company")},
                 "token_parity": {
                     "baseline_ctx_tokens": baseline_ret.get("prompt_tokens", 0),
                     "venra_ctx_tokens":    venra_ret.get("prompt_tokens", 0),

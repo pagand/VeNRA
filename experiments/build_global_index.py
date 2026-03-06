@@ -108,8 +108,8 @@ DATASETS = [
     "finqa_normalized.jsonl",
 ]
 
-CONCURRENCY_LIMIT = 3    # 4 keys × ~1.2 req/s ≈ 5 safe concurrent
-DEBUG_LIMIT       = 900  # Targeting 200-query yield (300 per dataset)
+CONCURRENCY_LIMIT = 2    # 4 keys × ~1.2 req/s ≈ 5 safe concurrent
+DEBUG_LIMIT       = 400  # Targeting 200-query yield (300 per dataset)
 MAX_CHUNKS_PER_DOC = 30  # Cap on massive documents to ensure distractor diversity
 MAX_CHUNK_CHARS   = 1500 # Blocks above this are split before SLM extraction.
 RANDOM_SEED       = 42
@@ -145,11 +145,13 @@ def _patch_entity_ids(rows: List[UFLRow], block: DocBlock, chunk_meta: Dict[str,
     """
     if not rows:
         return rows
-    company   = block.section_path[-1] if block.section_path else "Global_Entity"
+    
+    # We now fetch company cleanly from chunk_meta, which was populated perfectly at load time
+    meta = chunk_meta.get(block.id, {})
+    company = meta.get("company", "Global_Entity")
     entity_id = _company_to_entity_id(company)
     
     # Extract source records from metadata
-    meta = chunk_meta.get(block.id, {})
     record_ids = meta.get("source_records", [])
     
     for row in rows:

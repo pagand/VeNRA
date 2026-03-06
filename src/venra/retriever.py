@@ -401,10 +401,10 @@ class DualRetriever:
         # Every fact must belong to the target registrant OR be a global table.
         if company_scope and "company_label" in self.df.columns:
             mask &= (
-                (self.df["company_label"] == company_scope) | 
-                (self.df["company_label"] == "EXP_GLOBAL")
+                (self.df["company_label"] == company_scope) |
+                (self.df["company_label"] == "EXP_GLOBAL") |
+                (self.df["company_label"] == "Global_Entity")
             )
-
         # Ensure we never return explicitly hallucinated rows that failed grounding
         if "alignment_status" in self.df.columns:
             mask &= self.df["alignment_status"] != "UNALIGNED"
