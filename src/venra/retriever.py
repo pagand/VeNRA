@@ -193,6 +193,7 @@ class DualRetriever:
         include_all_chunks_for_ufl: bool = True,
         include_all_ufl_for_chunks: bool = True,
         doc_id: Optional[str] = None,
+        company: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Dual retrieval with Relational Expansion and Lexical Pre-Filtering.
@@ -211,7 +212,7 @@ class DualRetriever:
         )
 
         # 1. Core similarity
-        raw_hypothesis_chunks = self._query_vector(plan.vector_hypothesis, k=k)
+        raw_hypothesis_chunks = self._query_vector(plan.vector_hypothesis, k=k, doc_id=doc_id)
         hypothesis_chunks = self._apply_lexical_filter(
             raw_hypothesis_chunks, combined_query_tokens, label="hypothesis"
         )
@@ -222,7 +223,7 @@ class DualRetriever:
         if plan.vector_keywords:
             keyword_query = " ".join(plan.vector_keywords)
             logger.info(f"Keyword Boost Search: '{keyword_query}' (k={effective_k_keywords})")
-            raw_keyword_chunks = self._query_vector(keyword_query, k=effective_k_keywords)
+            raw_keyword_chunks = self._query_vector(keyword_query, k=effective_k_keywords, doc_id=doc_id)
             keyword_chunks = self._apply_lexical_filter(
                 raw_keyword_chunks, combined_query_tokens, label="keyword-boost"
             )
@@ -237,7 +238,12 @@ class DualRetriever:
         # 2. Direct UFL query
         ufl_query = plan.ufl_query
         selected_ufl_rows = (
-            self._query_ufl(ufl_query, combined_query_tokens, doc_id_scope=doc_id)
+            self._query_ufl(
+                ufl_query, 
+                combined_query_tokens, 
+                doc_id_scope=doc_id,
+                company_scope=company
+            )
             if ufl_query
             else []
         )
@@ -377,9 +383,10 @@ class DualRetriever:
 
     def _query_ufl(
         self,
-        filter_spec: Any,
+        filter_spec: UFLFilter,
         query_tokens: Optional[List[str]] = None,
         doc_id_scope: Optional[str] = None,
+        company_scope: Optional[str] = None,
     ) -> List[UFLRow]:
         """
         Query the UFL DataFrame applying entity, year, metric, and nuance_focus
@@ -389,6 +396,14 @@ class DualRetriever:
             return []
 
         mask = pd.Series(True, index=self.df.index)
+
+        # 0. Permissive Company Filtering (Bug 2 T0 Bleed Fix)
+        # Every fact must belong to the target registrant OR be a global table.
+        if company_scope and "company_label" in self.df.columns:
+            mask &= (
+                (self.df["company_label"] == company_scope) | 
+                (self.df["company_label"] == "EXP_GLOBAL")
+            )
 
         # Ensure we never return explicitly hallucinated rows that failed grounding
         if "alignment_status" in self.df.columns:
@@ -476,8 +491,15 @@ class DualRetriever:
     # Vector store helpers
     # ------------------------------------------------------------------
 
-    def _query_vector(self, hypothesis: str, k: int = 3) -> List[DocBlock]:
-        results = self.text_collection.query(query_texts=[hypothesis], n_results=k)
+    def _query_vector(self, hypothesis: str, k: int = 3, doc_id: Optional[str] = None) -> List[DocBlock]:
+        # We deliberately DO NOT filter by doc_id here.
+        # The vector search must remain GLOBAL to prove "Semantic Fusion"
+        # vulnerabilities in standard RAG. Filtering by doc_id would artificially
+        # boost the baseline's precision by preventing it from searching other companies.
+        results = self.text_collection.query(
+            query_texts=[hypothesis], 
+            n_results=k
+        )
         blocks: List[DocBlock] = []
         if not results["ids"] or not results["ids"][0]:
             return blocks

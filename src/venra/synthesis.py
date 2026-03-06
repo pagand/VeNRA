@@ -1423,21 +1423,40 @@ class ContextIndexer:
             embedding_function=self.embedding_fn,
         )
 
-    def index_blocks(self, blocks: List[DocBlock]):
+    def index_blocks(self, blocks: List[DocBlock], record_map: Optional[Dict[str, str]] = None):
         if not blocks:
             return
         documents = [b.content for b in blocks]
         ids = [b.id for b in blocks]
-        metadatas = [
-            {
+        metadatas = []
+        for b in blocks:
+            # Extract entity ID from section path (last element is usually the company)
+            company = b.section_path[-1] if b.section_path else "Global_Entity"
+            # FIX: Use the same canonicalization as the indexer
+            entity_id = self._company_to_id(company)
+            
+            meta = {
                 "block_type": b.block_type.value,
                 "section_path": json.dumps(b.section_path),
                 "page_num": b.page_num or 0,
+                "canonical_entity_id": entity_id,
             }
-            for b in blocks
-        ]
+            # Add source_record if provided (for strict doc-level scoping)
+            if record_map and b.id in record_map:
+                meta["source_record"] = record_map[b.id]
+            
+            metadatas.append(meta)
+            
         self.text_collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
-        logger.info(f"Indexed {len(blocks)} blocks in ChromaDB.")
+        logger.info(f"Indexed {len(blocks)} blocks in ChromaDB (with entity/record metadata).")
+
+    @staticmethod
+    def _company_to_id(company: str) -> str:
+        if not company or company in ("Global_Entity", "Unknown Entity", ""):
+            return "EXP_GLOBAL"
+        clean = re.sub(r"[^a-zA-Z0-9\s]", "", company)
+        clean = re.sub(r"\s+", "_", clean.strip()).upper()
+        return f"ID_{clean}"
 
     def index_ufl_schema(self, rows: List[UFLRow]):
         if not rows:

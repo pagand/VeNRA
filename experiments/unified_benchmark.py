@@ -61,6 +61,7 @@ import os
 import asyncio
 import random
 import sys
+import re
 from typing import List, Dict, Any
 
 from google import genai
@@ -251,6 +252,20 @@ class UnifiedBenchmark:
             for line in lines:
                 record = json.loads(line)
                 rec_id = record["id"]
+                
+                # FIX: Robust Company Extraction
+                if "company" in record.get("metadata", {}):
+                    # FinanceBench style
+                    record["company"] = record["metadata"]["company"]
+                elif ds_name.startswith("finqa") and "/" in rec_id:
+                    # FinQA style (finqa_ADI/2009/...)
+                    try:
+                        record["company"] = rec_id.split("_")[1].split("/")[0]
+                    except:
+                        record["company"] = None
+                else:
+                    record["company"] = record.get("company")
+                
                 if all(get_chunk_id(rec_id, chunk) in indexed_chunk_ids for chunk in record["context_chunks"]):
                     valid_lines.append(line)
             total_eligible += len(valid_lines)
@@ -262,7 +277,11 @@ class UnifiedBenchmark:
                 )
                 continue
 
-            sampled   = random.sample(valid_lines, min(count, len(valid_lines)))
+            # Deterministic shuffle to ensure diverse datasets but consistent resumption
+            rng = random.Random(RANDOM_SEED)
+            rng.shuffle(valid_lines)
+            sampled = valid_lines[:min(count, len(valid_lines))]
+            
             n_dropped = len(lines) - len(valid_lines)
             logger.info(
                 f"{ds_name}: {len(valid_lines)} eligible / {len(lines)} total "
@@ -372,7 +391,7 @@ class UnifiedBenchmark:
             json.dump(payload, f, indent=2)
         return payload
 
-    async def _venra_context(self, query: str, query_id: str, source_ds: str = "") -> Dict[str, Any]:
+    async def _venra_context(self, query: str, query_id: str, source_ds: str = "", company: Optional[str] = None) -> Dict[str, Any]:
         """
         VeNRA full retrieval: Navigator → DualRetriever (UFL + Lexical Gate)
         → ContextAssembler. Cached to disk.
@@ -395,8 +414,13 @@ class UnifiedBenchmark:
             logger.warning(f"Navigator failed to resolve entity for {query_id}. Scoping to record ID.")
             # Passing query_id as doc_id to retrieve() handles this via record-scoping logic
 
-        # BUG 2 FIX: pass doc_id for scoping
-        results = await self.retriever.retrieve(plan, k=TOP_K, doc_id=query_id)
+        # BUG 2 FIX: pass doc_id and company for scoping
+        results = await self.retriever.retrieve(
+            plan, 
+            k=TOP_K, 
+            doc_id=query_id,
+            company=company
+        )
 
         # BUG 2 FIX: UFL Row Cap & Multi-Entity Safeguard
         ufl_rows = results.get("ufl_rows", [])
@@ -454,6 +478,14 @@ class UnifiedBenchmark:
         with open(cache_path, "w") as f:
             json.dump(payload, f, indent=2)
         return payload
+
+    def _company_to_entity_id(self, company: str) -> str:
+        """Mirror the canonicalization logic in build_global_index.py."""
+        if not company or company in ("Global_Entity", ""):
+            return "EXP_GLOBAL"
+        clean = re.sub(r"[^a-zA-Z0-9\s]", "", company)
+        clean = re.sub(r"\s+", "_", clean.strip()).upper()
+        return f"ID_{clean}"
 
     # ── Generation ────────────────────────────────────────────────────────────
 
@@ -693,9 +725,13 @@ CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
                 continue
 
             # Retrieval is cached to disk — zero API cost on re-run.
+            raw_company = sample.get("company")
+            # Canonicalise: 'Best Buy' -> 'ID_BEST_BUY' to match the indexer
+            company_id = self._company_to_entity_id(raw_company) if raw_company else None
+            
             baseline_ret, venra_ret = await asyncio.gather(
                 self._baseline_context(query, query_id, source_ds),
-                self._venra_context(query, query_id, source_ds),
+                self._venra_context(query, query_id, source_ds, company=company_id),
             )
             
             # ... (rest of the retrieval logic)

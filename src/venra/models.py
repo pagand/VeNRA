@@ -70,6 +70,10 @@ class UFLRow(BaseModel):
         ...,
         description="Verbatim name as it appeared in the source document (e.g. 'Apple Inc.').",
     )
+    company_label: Optional[str] = Field(
+        None,
+        description="The specific company identifier inherited from chunk metadata (e.g. 'Best Buy'). Critical for cross-entity bleed prevention.",
+    )
     metric_name: str = Field(
         ...,
         description="Semantic key used by the Code Agent (e.g. 'Revenue', 'Gross Margin').",

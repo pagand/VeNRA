@@ -378,18 +378,19 @@ def is_exact_match(predicted: str, golden: str, label: str = "Supported", trace:
             p_floats = [float(n) for n in pred_nums]
             for g in g_floats:
                 for p in p_floats:
-                    # Check gold as decimal, pred as percentage (0.12 vs 12.0)
-                    if abs(g * 100 - p) < 0.015: return True
-                    # Check gold as percentage, pred as decimal (12.0 vs 0.12)
-                    if abs(g - p * 100) < 0.015: return True
-                    # Check direct float match (handles 12.0001 vs 12.0)
-                    if abs(g - p) < 0.015: return True
-                    # NEW: Relative error tolerance (0.5%) to rescue high-precision 
-                    # or unit-conversion answers (e.g., gold=5466, pred=5466.312)
+                    # A. Direct float match with relative tolerance (0.5%)
+                    # Rescues high-precision PAL vs rounded gold (e.g. Netflix 5466.312 vs 5466)
                     if g != 0:
-                        relative_error = abs(g - p) / abs(g)
-                        if relative_error <= 0.005:
-                            return True
+                        if abs(g - p) / abs(g) <= 0.005: return True
+                    elif abs(g - p) < 0.015: return True
+
+                    # B. Percentage vs Decimal match (0.12 vs 12.0)
+                    # Rescues FinQA ambiguity (e.g. FRT 0.10353 vs 10.35%)
+                    if g != 0:
+                        # Check gold as decimal, pred as percentage
+                        if abs(g * 100 - p) / abs(g * 100) <= 0.01: return True
+                        # Check gold as percentage, pred as decimal
+                        if abs(g - p * 100) / abs(g) <= 0.01: return True
         except (ValueError, TypeError):
             pass
 
@@ -826,16 +827,29 @@ class MetricExtractor:
         return str(Counter(df[col].dropna()).get("TYPE_6_GOLD_AMBIGUITY", 0))
 
     def _rescue_rate(self, df):
-        if "retrieval.first_pass_miss" not in df.columns or "retrieval.coverage_gap" not in df.columns:
+        """
+        Navigator Rescue Rate (Experiment 2)
+        
+        Denominator: All samples where the baseline (vector) and VeNRA retrieval 
+                     performance differed (The "Delta Set").
+        Numerator:   Samples where VeNRA succeeded (recall=True).
+        
+        A Navigator failure (Baseline=True, VeNRA=False) now correctly reduces 
+         this rate towards 0% instead of being suppressed.
+        """
+        if "retrieval.baseline_recall" not in df.columns or "retrieval.venra_recall" not in df.columns:
             return "—"
-        # Rescue: first_pass_miss is True, venra_recall is True, AND coverage_gap is False
-        # We only count samples where the data WAS in the index (coverage_gap=False) 
-        # but the baseline vector search missed it (first_pass_miss=True).
-        valid_denominator = df[(df['retrieval.first_pass_miss'] == True) & (df['retrieval.coverage_gap'] == False)]
-        if valid_denominator.empty:
+            
+        # The Delta Set: cases where one system found the gold and the other didn't
+        delta_set = df[df['retrieval.baseline_recall'] != df['retrieval.venra_recall']]
+        
+        if delta_set.empty:
+            # If they are identical on every sample, there were no rescues or failures
             return "—"
-        rescues = valid_denominator[valid_denominator['retrieval.venra_recall'] == True]
-        rate = len(rescues) / len(valid_denominator)
+            
+        # Success is when VeNRA found the gold (recall=True)
+        rescues = delta_set[delta_set['retrieval.venra_recall'] == True]
+        rate = len(rescues) / len(delta_set)
         return f"{rate:.1%}"
 
     def _save_results(self, summary: List[Dict]):

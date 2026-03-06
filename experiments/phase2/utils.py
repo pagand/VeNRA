@@ -152,8 +152,28 @@ def get_completed_ids(path: Path) -> Set[int]:
 # ---------------------------------------------------------------------------
 
 def load_manifest() -> List[Dict[str, Any]]:
+    """Full manifest load — includes input_components/output_components.
+    Use only when you need the raw text (e.g. building prompts).
+    For metrics, use load_manifest_slim() instead."""
     with open(MANIFEST_PATH) as f:
         return json.load(f)
+
+
+def load_manifest_slim() -> List[Dict[str, Any]]:
+    """
+    Lightweight manifest loader for metrics computation.
+    Reads only the 5 fields needed for pool routing and scoring,
+    skipping input_components / output_components (which hold full
+    financial contexts and can make the manifest 30-80 MB).
+
+    Fields returned per row:
+      row_id, pool, ground_truth, sabotage_type, cot_subsample
+    """
+    KEEP = {"row_id", "pool", "ground_truth", "sabotage_type", "cot_subsample",
+            "family_id", "meta_token_count", "label"}
+    with open(MANIFEST_PATH) as f:
+        full = json.load(f)
+    return [{k: v for k, v in row.items() if k in KEEP} for row in full]
 
 
 def load_prompts_venra() -> Dict[int, str]:

@@ -109,7 +109,8 @@ DATASETS = [
 ]
 
 CONCURRENCY_LIMIT = 3    # 4 keys × ~1.2 req/s ≈ 5 safe concurrent
-DEBUG_LIMIT       = 50  # 900 Targeting 200-query yield (300 per dataset)
+DEBUG_LIMIT       = 900  # Targeting 200-query yield (300 per dataset)
+MAX_CHUNKS_PER_DOC = 30  # Cap on massive documents to ensure distractor diversity
 MAX_CHUNK_CHARS   = 1500 # Blocks above this are split before SLM extraction.
 RANDOM_SEED       = 42
 
@@ -154,6 +155,7 @@ def _patch_entity_ids(rows: List[UFLRow], block: DocBlock, chunk_meta: Dict[str,
     for row in rows:
         row.canonical_entity_id = entity_id
         row.entity_name_raw     = company
+        row.company_label       = entity_id # Lock the CANONICAL ID at write time
         # We store the first record ID as a primary anchor; 
         # Multi-record chunks are rare in this evaluation.
         if record_ids:
@@ -420,7 +422,7 @@ async def main():
             fully_processed, needs_processing = [], []
             for rec_id in rec_ids:
                 cids = record_to_chunks.get(rec_id, [])
-                if not cids:
+                if not cids or len(cids) > MAX_CHUNKS_PER_DOC:
                     continue
                 if all(cid in processed_ids for cid in cids):
                     fully_processed.append((rec_id, cids))
@@ -484,7 +486,15 @@ async def main():
         # 5. Vector indexing (new blocks only)
         logger.info(f"Indexing {len(blocks_to_process)} new chunks into ChromaDB…")
         indexer = ContextIndexer(db_path=CHROMA_DB_PATH)
-        indexer.index_blocks(blocks_to_process)
+        
+        # Build a record map for indexing: cid -> rec_id
+        # This enables strict document-level scoping in retrieve()
+        record_map = {}
+        for rec_id, cids in record_to_chunks.items():
+            for cid in cids:
+                record_map[cid] = rec_id
+                
+        indexer.index_blocks(blocks_to_process, record_map=record_map)
 
         # 6. UFL synthesis
         # Both TableMelter and ResilientTextSynthesizer use entity_id="EXP_GLOBAL"
