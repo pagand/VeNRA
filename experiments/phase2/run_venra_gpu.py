@@ -3,7 +3,7 @@ experiments/phase2/run_venra_gpu.py
 -------------------------------------
 VeNRA Sentinel SALSA inference on GPU (RTX 3090).
 
-Loads adapter r128, merges weights for speed, runs batched forward pass.
+Loads adapter r96, merges weights for speed, runs batched forward pass.
 Reads one logit position (last token = "Label:"), applies 3-class softmax.
 Crash-safe: skips already-written row_ids on restart.
 
@@ -39,7 +39,7 @@ from experiments.phase2.utils import (
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_MODEL       = "Qwen/Qwen2.5-Coder-3B-Instruct"
 ADAPTER_ID       = "pagand/venra"
-ADAPTER_REVISION = "r128"
+ADAPTER_REVISION = "r96"
 BATCH_SIZE       = 8
 MAX_SEQ_LENGTH   = 4096
 OUT_FILE         = PRED_FILES["venra_salsa"]

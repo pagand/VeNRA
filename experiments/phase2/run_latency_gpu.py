@@ -49,7 +49,7 @@ from experiments.phase2.utils import (
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_MODEL       = "Qwen/Qwen2.5-Coder-3B-Instruct"
 ADAPTER_ID       = "pagand/venra"
-ADAPTER_REVISION = "r128"
+ADAPTER_REVISION = "r96"
 MAX_SEQ_LENGTH   = 4096
 MAX_NEW_TOKENS   = 150     # CoT ceiling — matches paper claim
 WARMUP_PASSES    = 3

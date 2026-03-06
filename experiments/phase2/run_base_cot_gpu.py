@@ -1,19 +1,16 @@
 """
 experiments/phase2/run_base_cot_gpu.py
 ----------------------------------------
-Base model Chain-of-Thought inference on the FULL test set.
+Base model Chain-of-Thought inference on the 50-pair CoT subsample (~100 rows).
 
 PURPOSE: Quantify the "test-time compute budget" the base model needs to
 reach a correct verdict vs VeNRA SALSA's budget of exactly 1 token.
-This is the empirical proof of the "1.5 thinking" claim:
-  - VeNRA reads 1 token, budget = 1
-  - Base model reasons for N tokens to reach the same verdict
+This is the empirical proof of the "1.5 thinking" claim.
 
-The comparison is fair only if both run on the same full test set.
-The earlier 50-pair "subsample" idea was dropped because:
-  a) All other scripts already run the full set
-  b) The 3090 handles CoT × 800 rows comfortably
-  c) A subsample can only compute flip rate, not the full composite M
+Only runs on rows where cot_subsample=True AND pool is a pair pool.
+That is ~100 rows (50 parent + 50 child), built by build_manifest.py.
+Running CoT on the full 800+ row test set would take hours sequentially
+and adds nothing — the budget distribution is the claim, not the composite M.
 
 Key outputs per row:
   pred          — label parsed from LAST valid word in generation
@@ -44,11 +41,12 @@ from tqdm import tqdm
 
 from experiments.phase2.utils import (
     ensure_dirs,
-    load_manifest_slim,
+    load_manifest,
     load_prompts_frontier,
     get_completed_ids,
     write_prediction,
     parse_cot_response,
+    ALL_PAIR_TAGS,
     PRED_FILES,
 )
 
@@ -114,18 +112,33 @@ def main() -> None:
     model.eval()
     print(f"[model] Ready on {next(model.parameters()).device}")
 
-    print("\n[data] Loading manifest (slim) + frontier prompts...")
-    manifest  = load_manifest_slim()
+    print("\n[data] Loading manifest + frontier prompts...")
+    manifest  = load_manifest()
     frontier  = load_prompts_frontier()
     completed = get_completed_ids(OUT_FILE)
 
-    # ALL rows — no subsample filter
-    todo = [r for r in manifest if r["row_id"] not in completed]
-    print(f"[eval] Total: {len(manifest)} | Completed: {len(completed)} | Remaining: {len(todo)}")
+    # Only rows flagged as cot_subsample AND in a pair pool.
+    # build_manifest.py guarantees cot_subsample=True only on pair rows
+    # (not axiom/natural), so the second check is a safety guard.
+    cot_rows = [
+        r for r in manifest
+        if r.get("cot_subsample", False)
+        and r["pool"] in ALL_PAIR_TAGS
+        and r["row_id"] not in completed
+    ]
+    total_cot = sum(
+        1 for r in manifest
+        if r.get("cot_subsample", False) and r["pool"] in ALL_PAIR_TAGS
+    )
 
-    if not todo:
+    print(f"[eval] CoT subsample rows: {total_cot} total | "
+          f"Completed: {total_cot - len(cot_rows)} | Remaining: {len(cot_rows)}")
+
+    if not cot_rows:
         print("[eval] All done. Exiting.")
         return
+
+    todo = cot_rows
 
     for row in tqdm(todo, desc="Base CoT", unit="row"):
         rid = row["row_id"]
