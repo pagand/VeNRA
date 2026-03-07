@@ -85,6 +85,7 @@ from venra.agent import ReasoningAgent
 from venra.assembler import ContextAssembler
 from venra.navigator import Navigator
 from venra.logging_config import logger
+from venra.config import settings
 
 # Single source of truth for chunk ID generation.
 # Never reimplement inline — a hash mismatch makes every record appear
@@ -122,9 +123,9 @@ GEN_CONCURRENCY = 1
 GEN_SLEEP       = 2.0  # Seconds between runs in sequential mode
 
 SAMPLE_COUNTS: Dict[str, int] = {
-    "financebench_normalized.jsonl":    60,   # production: 75
+    "financebench_normalized.jsonl":    90,   # production: 75
     "tatqa_normalized_test_gold.jsonl": 60,   # production: 75
-    "finqa_normalized.jsonl":           40,   # production: 50
+    "finqa_normalized.jsonl":           25,   # production: 50
 }
 RANDOM_SEED = 42
 TOP_K       = 5
@@ -201,11 +202,22 @@ class UnifiedBenchmark:
         # Groq Client (using instructor for structured output)
         from openai import AsyncOpenAI
         import instructor
-        groq_api_key = os.environ.get("GROQ_API_KEY")
-        if not groq_api_key:
-            raise EnvironmentError("GROQ_API_KEY not found.")
-        raw_groq = AsyncOpenAI(api_key=groq_api_key)
-        self._groq = instructor.from_openai(raw_groq, mode=instructor.Mode.JSON)
+        import itertools
+        
+        groq_keys = settings.GROQ_KEYS
+        if not groq_keys:
+            raise EnvironmentError("No GROQ_API_KEYs found in .env")
+        
+        # Create a pool of clients for rotation
+        self._groq_clients = [
+            AsyncOpenAI(base_url="https://api.groq.com/openai/v1", api_key=k, timeout=60.0)
+            for k in groq_keys
+        ]
+        self._groq_cycle = itertools.cycle(self._groq_clients)
+        
+        # Instructor wrapper (we wrap the first client for schema definitions, 
+        # but we will swap clients during calls to ensure rotation)
+        self._groq = instructor.from_openai(self._groq_clients[0], mode=instructor.Mode.JSON)
 
         self.retriever = DualRetriever(ufl_path=UFL_PATH, db_path=CHROMA_DB_PATH)
         self.navigator = Navigator(schema_path=SCHEMA_PATH)
@@ -494,7 +506,9 @@ class UnifiedBenchmark:
                 else:
                     raw_text = response.text.strip()
             else:
-                response = await self._groq.chat.completions.create(
+                # Use Groq for Qwen (with key rotation)
+                client = next(self._groq_cycle)
+                response = await client.chat.completions.create(
                     model=ACTIVE_MODEL,
                     messages=[
                         {"role": "system", "content": COT_SYSTEM_PROMPT},
@@ -502,7 +516,6 @@ class UnifiedBenchmark:
                     ],
                     temperature=0.0,
                     max_tokens=4096,
-                    response_model=None
                 )
                 raw_text     = response.choices[0].message.content.strip()
                 finish_reason = response.choices[0].finish_reason
@@ -545,60 +558,94 @@ class UnifiedBenchmark:
         last_error      = "Unknown"
         finish_reason_1 = "UNKNOWN"
 
-        # ── Single attempt — no retry, no sleep ───────────────────────────────
-        try:
-            if MODEL_TYPE == "GEMINI":
-                safe_user_prompt_1 = user_prompt_1[:30000]
-                prompt_len_1 = _estimate_tokens(safe_user_prompt_1)
-                logger.info(f"Gemini PAL Pass 1 prompt size: {prompt_len_1} tokens")
+        # ── Execution Logic ───────────────────────────────────────────────────
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                if MODEL_TYPE == "GEMINI":
+                    safe_user_prompt_1 = user_prompt_1[:30000]
+                    if attempt == 0:
+                        logger.info(f"Gemini PAL Pass 1 prompt size: {_estimate_tokens(safe_user_prompt_1)} tokens")
 
-                reasoning_resp = await asyncio.to_thread(
-                    self._gemini.models.generate_content,
-                    model=ACTIVE_MODEL,
-                    contents=safe_user_prompt_1,
-                    config=types.GenerateContentConfig(
-                        system_instruction=pass_1_prompt,
+                    response = await asyncio.to_thread(
+                        self._gemini.models.generate_content,
+                        model=ACTIVE_MODEL,
+                        contents=safe_user_prompt_1,
+                        config=types.GenerateContentConfig(
+                            system_instruction=pass_1_prompt,
+                            temperature=0.0,
+                            max_output_tokens=4096,
+                            response_mime_type="application/json",
+                            response_schema=AgentReasoning,
+                        ),
+                    )
+                    
+                    # 1. Capability Failure: API worked, but model failed to follow schema/reason
+                    if not response or not hasattr(response, "parsed") or not response.parsed:
+                        f_reason = "UNKNOWN"
+                        if response and hasattr(response, "candidates") and response.candidates:
+                            f_reason = str(response.candidates[0].finish_reason)
+                        
+                        logger.warning(f"Cognitive Failure (No Retry): Empty reasoning. Finish: {f_reason}")
+                        return {
+                            "answer": "GENERATION_FAILURE", # THIS WILL BE SAVED
+                            "code_executed": None,
+                            "prompt_tokens": 0,
+                            "full_response": {"error": "Model failed to generate valid reasoning schema", "finish_reason": f_reason}
+                        }
+                    
+                    reasoning = response.parsed
+                
+                else:
+                    # QWEN via Groq (instructor pattern with key rotation)
+                    client = next(self._groq_cycle)
+                    import instructor
+                    instr_client = instructor.from_openai(client, mode=instructor.Mode.JSON)
+                    
+                    reasoning, completion = await instr_client.chat.completions.create_with_completion(
+                        model=ACTIVE_MODEL,
+                        messages=[
+                            {"role": "system", "content": pass_1_prompt},
+                            {"role": "user",   "content": user_prompt_1}
+                        ],
                         temperature=0.0,
-                        max_output_tokens=4096,
-                        response_mime_type="application/json",
-                        response_schema=AgentReasoning,
-                    ),
-                )
+                        max_tokens=4096,
+                        response_model=AgentReasoning
+                    )
+                    finish_reason_1 = completion.choices[0].finish_reason
+                
+                if not reasoning:
+                    raise ValueError("Empty reasoning generated")
+                break
 
-                if reasoning_resp and hasattr(reasoning_resp, "candidates") and reasoning_resp.candidates:
-                    finish_reason_1 = str(reasoning_resp.candidates[0].finish_reason)
-
-                if not reasoning_resp or not hasattr(reasoning_resp, "parsed"):
-                    raise ValueError(f"response.parsed missing. Finish reason: {finish_reason_1}")
-                reasoning = reasoning_resp.parsed
-            else:
-                reasoning, completion = await self._groq.chat.completions.create_with_completion(
-                    model=ACTIVE_MODEL,
-                    messages=[
-                        {"role": "system", "content": pass_1_prompt},
-                        {"role": "user",   "content": user_prompt_1}
-                    ],
-                    temperature=0.0,
-                    max_tokens=4096,
-                    response_model=AgentReasoning
-                )
-                finish_reason_1 = completion.choices[0].finish_reason
-
-            if not reasoning:
-                raise ValueError("Empty reasoning generated")
-
-        except Exception as e:
-            last_error = str(e)
-            logger.warning(f"PAL Pass 1 failed (no retry): {e}")
-            # reasoning remains None → outer try/except returns GENERATION_FAILURE
+            except Exception as e:
+                # 2. Infrastructure Failure: API itself crashed or timed out
+                infra_triggers = ["429", "rate limit", "timeout", "connection", "500", "503", "quota"]
+                if any(t in str(e).lower() for t in infra_triggers):
+                    wait_time = (attempt + 1) * 3
+                    logger.warning(f"Infra Failure (Attempt {attempt+1}): {e}. Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    # Logic/Parsing Error: Consider it a Capability Failure
+                    logger.error(f"Logic Error: {e}")
+                    return {
+                        "answer": "GENERATION_FAILURE",
+                        "code_executed": None,
+                        "prompt_tokens": 0,
+                        "full_response": {"error": str(e)}
+                    }
+        else:
+            # 3. Exhausted Infra retries
+            return {
+                "answer": "TIMEOUT_FAILURE", # THIS WILL NOT BE SAVED (Retried next session)
+                "code_executed": False,
+                "prompt_tokens": 0,
+                "full_response": {"error": f"Infra exhausted: {last_error}"}
+            }
 
         try:
-            if not reasoning:
-                raise ValueError(
-                    f"Pass 1 model ({ACTIVE_MODEL}) failed. Last error: {last_error}"
-                )
-
-            # ── Execute Code ──────────────────────────────────────────────────
+            # --- Execute Code ---
             code_result = {"output": "No code run", "error": None}
             if reasoning.requires_math and reasoning.python_code:
                 code_result = self.agent.executor.execute(reasoning.python_code)
@@ -687,7 +734,7 @@ class UnifiedBenchmark:
                 # terminal failure, drop it from results so it gets retried.
                 clean_results = []
                 processed_ids = set()
-                sentinels = {"GENERATION_FAILURE", "TIMEOUT_FAILURE"}
+                sentinels = {"TIMEOUT_FAILURE"}
                 
                 for r in results:
                     runs = r.get("runs", {})
@@ -788,14 +835,15 @@ class UnifiedBenchmark:
                 }
                 run_1 = run_2 = run_3 = run_4 = error_resp
 
-            # --- RECOVERY FIX (Phase 2): DO NOT SAVE if any run hit a failure ---
-            # This prevents the checkpoint from being corrupted with generation failures.
-            # Next time we run, these failed samples will be retried automatically.
-            sentinels = {"GENERATION_FAILURE", "TIMEOUT_FAILURE"}
-            any_fail = any(r.get("answer") in sentinels for r in [run_1, run_2, run_3, run_4])
+            # --- RECOVERY GUARD (Phase 2): ONLY skip if it was an INFRA failure ---
+            # Cognitive failures (GENERATION_FAILURE) are valid data points and MUST 
+            # be saved to prevent infinite retries of hard samples.
+            # Infra failures (TIMEOUT_FAILURE) are skipped so they can be retried.
+            infra_sentinels = {"TIMEOUT_FAILURE"}
+            any_infra_fail = any(r.get("answer") in infra_sentinels for r in [run_1, run_2, run_3, run_4])
             
-            if any_fail:
-                logger.warning(f"Generation failure for {query_id}. Sample will NOT be saved to checkpoint.")
+            if any_infra_fail:
+                logger.warning(f"Infra failure for {query_id}. Sample will NOT be saved and will retry later.")
                 pbar.update(1)
                 continue
 
