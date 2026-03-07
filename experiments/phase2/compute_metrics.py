@@ -55,15 +55,24 @@ from experiments.phase2.utils import (
     posterior_mean,
 )
 
-# Canonical model order for all output tables
+# Set version for fast membership test in subsample filter
+ALL_PAIR_TAGS_SET = set(ALL_PAIR_TAGS) if not isinstance(ALL_PAIR_TAGS, set) else ALL_PAIR_TAGS
+
+# Full-coverage models — ran on all 812 test rows, composite M is valid.
 ALL_MODELS = [
     ("venra_salsa",        "VeNRA 3B SALSA"),
     ("base_qwen_zeroshot", "Base Qwen 3B (zero-shot)"),
-    ("base_qwen_cot",      "Base Qwen 3B (CoT)"),
-    ("gemini_3_flash",     "Gemini-3-Flash-Preview"),
-    ("kimi_k25_nvidia",    "Kimi K2.5 (NVIDIA NIM)"),
-    ("qwen3_32b_groq",     "Qwen3-32B (Groq)"),
-    ("llama33_70b_groq",   "Llama 3.3 70B (Groq)"),
+]
+
+# Subsample-only models — ran on the 92-row CoT subsample, flip rate only.
+# Frontier API models default to subsample (cost/comparability).
+# If a model file is missing it is silently skipped everywhere.
+FRONTIER_MODELS = [
+    ("gemini_3_flash",    "Gemini-3-Flash-Preview"),
+    ("kimi_k25_nvidia",   "Kimi K2.5 (NVIDIA NIM)"),
+    ("qwen3_32b_groq",    "Qwen3-32B (Groq)"),
+    ("llama33_70b_groq",  "Llama 3.3 70B (Groq)"),
+    ("gpt_oss_120b_groq", "GPT-OSS-120B (Groq)"),
 ]
 
 
@@ -72,18 +81,27 @@ ALL_MODELS = [
 # ---------------------------------------------------------------------------
 
 def compute_metrics_for_model(
-    model_key:  str,
-    manifest:   List[Dict],
+    model_key:      str,
+    manifest:       List[Dict],
+    subsample_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
-    Compute all metrics for one model against the full test manifest.
+    Compute metrics for one model.
+    subsample_only=True restricts to cot_subsample pair rows (frontier models).
     Returns None if prediction file not found or empty.
     """
     preds_by_id = load_predictions(model_key)
     if not preds_by_id:
         return None
 
-    arrays   = build_pool_arrays(manifest, preds_by_id)
+    active = manifest
+    if subsample_only:
+        active = [r for r in manifest
+                  if r.get("cot_subsample", False) and r["pool"] in ALL_PAIR_TAGS_SET]
+        if not active:
+            return None
+
+    arrays   = build_pool_arrays(active, preds_by_id)
     preds    = arrays["preds"]
     idx      = arrays["idx"]
     sab_np   = arrays["sab_types"]
@@ -273,55 +291,70 @@ def print_sabotage_table(results: Dict[str, Any]) -> None:
 
 
 def print_cot_table(
-    results: Dict[str, Any],
-    budget:  Optional[Dict],
+    full_results:     Dict[str, Any],
+    subsample_results: Dict[str, Any],
+    budget:           Optional[Dict],
 ) -> None:
     """
-    Side-by-side comparison of VeNRA SALSA vs Base zero-shot vs Base CoT.
-    All three now run on the full test set so full M is available.
-    The token budget column shows the key difference: 1 vs N tokens.
+    Subsample comparison table: VeNRA, base zero-shot, base CoT, + all frontier models.
+    All evaluated on the same 92-row CoT subsample — flip rate is the only
+    valid metric (natural/axiom pools absent). Composite M shown for GPU models
+    that have full-coverage results; frontier models show N/A.
     """
-    COT_MODELS = ["venra_salsa", "base_qwen_zeroshot", "base_qwen_cot"]
-    available  = [k for k in COT_MODELS if k in results]
+    # Row order: GPU full-coverage first, then CoT, then frontier
+    SUBSAMPLE_ORDER = [
+        ("venra_salsa",       "VeNRA 3B SALSA",            "1"),
+        ("base_qwen_zeroshot","Base Qwen 3B (zero-shot)",   "1"),
+        ("base_qwen_cot",     "Base Qwen 3B (CoT, ~N tok)", None),   # tokens from budget
+    ] + [(k, d, "1") for k, d in FRONTIER_MODELS]
+
+    # Merge full + subsample results — subsample FR takes priority for display
+    available = {}
+    for key, display, tok in SUBSAMPLE_ORDER:
+        sub = subsample_results.get(key)
+        full = full_results.get(key)
+        if sub is None and full is None:
+            continue
+        available[key] = (display, tok, sub, full)
 
     if not available:
         return
 
-    print("\n" + "=" * 80)
-    print("BASE CoT vs SALSA COMPARISON  (1.5 Thinking Claim)")
-    print("VeNRA SALSA achieves in 1 token what the base model needs N tokens for")
-    print("=" * 80)
-    print(f"{'Model':<36} {'Tokens':>8} {'FR':>8} {'M':>10}")
-    print("-" * 80)
+    W = 88
+    print("\n" + "=" * W)
+    print("SUBSAMPLE COMPARISON — 92 rows, 50 pairs (same scope for all models)")
+    print("Flip Rate is the primary metric here; Composite M shown for full-coverage models only.")
+    print("=" * W)
+    print(f"{'Model':<38} {'Tokens':>8} {'FR (subsample)':>15} {'M (full set)':>13}")
+    print("-" * W)
 
-    for key in available:
-        m     = results[key]
-        name  = m["display_name"][:35]
-        fr    = _pct(m["fr_global"])
-        comp  = f"{m['composite']:.4f}"
-        if key in ("venra_salsa", "base_qwen_zeroshot"):
-            tok_str = "1"
-        else:
+    for key, (display, tok_hint, sub, full) in available.items():
+        if key == "base_qwen_cot":
             tok_str = f"~{budget['median']:.0f}" if budget else "?"
-        print(f"{name:<36} {tok_str:>8} {fr:>8} {comp:>10}")
+        else:
+            tok_str = tok_hint or "1"
 
-    print("=" * 80)
+        fr_val   = sub["fr_global"] if sub else (full["fr_global"] if full else None)
+        fr_str   = _pct(fr_val) if fr_val is not None else "—"
+        comp_str = f"{full['composite']:.4f}" if full else "subsample only"
+
+        print(f"{display[:37]:<38} {tok_str:>8} {fr_str:>15} {comp_str:>13}")
+
+    print("=" * W)
 
     if budget:
-        salsa_fr = results.get("venra_salsa",        {}).get("fr_global", 0)
-        cot_fr   = results.get("base_qwen_cot",      {}).get("fr_global", 0)
-        base_fr  = results.get("base_qwen_zeroshot",  {}).get("fr_global", 0)
-        print(f"\n  Token budget (Base CoT, n={budget['n']} rows):")
-        print(f"    Median {budget['median']:.0f} tokens  |  "
-              f"P95 {budget['p95']:.0f} tokens  |  Max {budget['max']:.0f} tokens")
+        salsa_fr = (subsample_results.get("venra_salsa") or full_results.get("venra_salsa") or {}).get("fr_global", 0)
+        cot_fr   = (subsample_results.get("base_qwen_cot") or {}).get("fr_global", 0)
+        base_fr  = (subsample_results.get("base_qwen_zeroshot") or full_results.get("base_qwen_zeroshot") or {}).get("fr_global", 0)
+
+        print(f"\n  Base CoT token budget (n={budget['n']} rows): "
+              f"median={budget['median']:.0f}  P95={budget['p95']:.0f}  max={budget['max']:.0f}")
         if cot_fr > 0:
-            print(f"\n  VeNRA SALSA flip rate / Base CoT flip rate = "
-                  f"{salsa_fr/cot_fr:.2f}×  "
-                  f"(at 1 token vs ~{budget['median']:.0f} tokens)")
+            print(f"  VeNRA / Base CoT flip rate ratio : {salsa_fr/cot_fr:.2f}×  "
+                  f"(1 token vs ~{budget['median']:.0f} tokens)")
         if base_fr > 0:
-            print(f"  VeNRA SALSA flip rate / Base zero-shot flip rate = "
-                  f"{salsa_fr/base_fr:.2f}×  "
-                  f"(fine-tuning contribution, both at 1 token)")
+            print(f"  VeNRA / Base zero-shot ratio     : {salsa_fr/base_fr:.2f}×  "
+                  f"(fine-tuning gain, both at 1 token)")
 
 
 # ---------------------------------------------------------------------------
@@ -339,27 +372,64 @@ def main() -> None:
           f"{sum(1 for r in manifest if r['pool']=='natural_true')} nat-true, "
           f"{sum(1 for r in manifest if r['pool']=='axiom')} axioms)")
 
-    full_results: Dict[str, Any] = {}
+    subsample = [r for r in manifest
+                 if r.get("cot_subsample", False) and r["pool"] in ALL_PAIR_TAGS_SET]
+    print(f"[load] CoT subsample: {len(subsample)} rows "
+          f"({sum(1 for r in subsample if r['pool'].endswith('parent'))} pairs)\n")
 
+    # ── Full-coverage metrics (GPU models only) ───────────────────────────────
+    full_results: Dict[str, Any] = {}
     for model_key, display_name in ALL_MODELS:
         pred_path = PRED_FILES.get(model_key)
         if pred_path and not pred_path.exists():
             print(f"[skip] {display_name:<35} — prediction file not found")
             continue
-
         print(f"[calc] {display_name:<35} ...", end=" ", flush=True)
-        m = compute_metrics_for_model(model_key, manifest)
+        m = compute_metrics_for_model(model_key, manifest, subsample_only=False)
         if m is None:
             print("no data")
             continue
-
         m["display_name"] = display_name
         full_results[model_key] = m
-        print(
-            f"M={m['composite']:.4f}  "
-            f"FR={_pct(m['fr_global'])}  "
-            f"covered={m['n']['total_covered']}/{len(manifest)}"
-        )
+        print(f"M={m['composite']:.4f}  FR={_pct(m['fr_global'])}  "
+              f"covered={m['n']['total_covered']}/{len(manifest)}")
+
+    # ── Subsample metrics (CoT + frontier API models) ─────────────────────────
+    # base_qwen_cot and all FRONTIER_MODELS run on the same 92 subsample rows.
+    # Only flip rate is meaningful here (no natural/axiom coverage).
+    subsample_results: Dict[str, Any] = {}
+
+    # Also compute subsample FR for GPU models so the comparison table is complete
+    for model_key, display_name in ALL_MODELS:
+        m = compute_metrics_for_model(model_key, manifest, subsample_only=True)
+        if m:
+            m["display_name"] = display_name
+            subsample_results[model_key] = m
+
+    # CoT
+    print(f"\n[calc] {'Base Qwen 3B (CoT)':<35} ...", end=" ", flush=True)
+    m_cot = compute_metrics_for_model("base_qwen_cot", manifest, subsample_only=True)
+    if m_cot:
+        m_cot["display_name"] = "Base Qwen 3B (CoT)"
+        subsample_results["base_qwen_cot"] = m_cot
+        print(f"FR={_pct(m_cot['fr_global'])}  covered={m_cot['n']['total_covered']}/{len(subsample)}")
+    else:
+        print("no data")
+
+    # Frontier API models
+    for model_key, display_name in FRONTIER_MODELS:
+        pred_path = PRED_FILES.get(model_key)
+        if pred_path and not pred_path.exists():
+            print(f"[skip] {display_name:<35} — prediction file not found")
+            continue
+        print(f"[calc] {display_name:<35} ...", end=" ", flush=True)
+        m = compute_metrics_for_model(model_key, manifest, subsample_only=True)
+        if m is None:
+            print("no data")
+            continue
+        m["display_name"] = display_name
+        subsample_results[model_key] = m
+        print(f"FR={_pct(m['fr_global'])}  covered={m['n']['total_covered']}/{len(subsample)}")
 
     # ── CoT budget stats ──────────────────────────────────────────────────────
     print("\n[calc] Token budget stats (Base CoT)...", end=" ", flush=True)
@@ -372,22 +442,24 @@ def main() -> None:
     # ── Save ──────────────────────────────────────────────────────────────────
     out_path = METRICS_DIR / "all_models_metrics.json"
     with open(out_path, "w") as f:
-        json.dump(
-            {"full_test_set": full_results, "cot_budget_stats": budget_stats},
-            f, indent=2,
-        )
+        json.dump({
+            "full_test_set":      full_results,
+            "subsample_results":  subsample_results,
+            "cot_budget_stats":   budget_stats,
+        }, f, indent=2)
     print(f"\n[save] → {out_path}")
 
     # ── Print tables ──────────────────────────────────────────────────────────
     if full_results:
         print_main_table(full_results)
         print_sabotage_table(full_results)
-        print_cot_table(full_results, budget_stats)
-    else:
-        print("\n[warn] No complete prediction files found. Run inference scripts first.")
-        print("       GPU:    run_venra_gpu.py  run_base_model_gpu.py  run_base_cot_gpu.py")
-        print("       Laptop: run_frontier_api.py --model {gemini,kimi,qwen3,llama70b}")
-        print("       Then copy all predictions/ files to one machine before compute_metrics.")
+    print_cot_table(full_results, subsample_results, budget_stats)
+
+    if not full_results and not subsample_results:
+        print("\n[warn] No prediction files found.")
+        print("  GPU    : run_venra_gpu.py  run_base_model_gpu.py  run_base_cot_gpu.py")
+        print("  Laptop : run_frontier_api.py --model {gemini,kimi,qwen3,llama70b,gpt_oss_120b}")
+        print("  Then scp predictions/*.jsonl to one machine and re-run compute_metrics.")
 
 
 if __name__ == "__main__":

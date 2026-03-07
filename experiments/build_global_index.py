@@ -109,7 +109,7 @@ DATASETS = [
 ]
 
 CONCURRENCY_LIMIT = 2    # 4 keys × ~1.2 req/s ≈ 5 safe concurrent
-DEBUG_LIMIT       = 400  # Targeting 200-query yield (300 per dataset)
+DEBUG_LIMIT       = 900  # Targeting 200-query yield (300 per dataset)
 MAX_CHUNKS_PER_DOC = 30  # Cap on massive documents to ensure distractor diversity
 MAX_CHUNK_CHARS   = 1500 # Blocks above this are split before SLM extraction.
 RANDOM_SEED       = 42

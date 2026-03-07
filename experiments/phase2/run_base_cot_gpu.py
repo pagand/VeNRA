@@ -53,37 +53,53 @@ from experiments.phase2.utils import (
 # ── Config ─────────────────────────────────────────────────────────────────────
 BASE_MODEL     = "Qwen/Qwen2.5-Coder-3B-Instruct"
 MAX_SEQ_LENGTH = 4096
-MAX_NEW_TOKENS = 300
+MAX_NEW_TOKENS = 500
 OUT_FILE       = PRED_FILES["base_qwen_cot"]
 
 COT_CLOSING = (
-    "Think step by step through each AUDIT ALGORITHM check above. "
-    "After your reasoning, write your final verdict on the last line "
-    "as exactly one word: Found, Fake, or General."
+    "\n\nThink step by step through each AUDIT ALGORITHM check above. "
+    "After your reasoning, write your final verdict on the very last line "
+    "as exactly one word — nothing else on that line: Found, Fake, or General."
 )
+
+COT_PREFILL = "Let me analyze each AUDIT ALGORITHM criterion:\n\n"
 
 
 def build_cot_prompt(system_content: str, user_content: str) -> str:
     """
-    Frontier prompt → Qwen CoT prompt.
-    Strips trailing 'Label:' and replaces label-first instruction with
-    reason-then-label instruction. Model generates freely; we parse the
-    LAST valid label word from output.
+    Build a CoT prompt by pre-filling the start of the assistant turn.
+
+    WHY PRE-FILL: Qwen2.5-Instruct is heavily aligned to give short, direct
+    answers in chat format. Appending reasoning instructions to the user turn
+    does not help — the model still snaps to one label word (token_budget=1)
+    because that IS the correct behavior for a well-aligned chat model.
+    Pre-filling the assistant turn forces the model to CONTINUE the started
+    reasoning rather than respond to it, bypassing the short-answer bias.
+
+    The pre-fill tokens are part of the input; token_budget counts only the
+    new tokens the model generates after the pre-fill.
     """
     user_cot = user_content.rstrip()
+
+    # Strip trailing 'Label:' conditioning suffix
     if user_cot.endswith("Label:"):
         user_cot = user_cot[: -len("Label:")].rstrip()
 
+    # Strip any label-first instruction
     for phrase in [
         "Output your label (Found, Fake, or General) first, followed by your analysis.",
         "Output label (Found, Fake, or General) first, followed by your analysis.",
     ]:
-        user_cot = user_cot.replace(phrase, COT_CLOSING)
+        user_cot = user_cot.replace(phrase, "").rstrip()
 
+    # Append the task instruction to the user turn
+    user_cot = user_cot + COT_CLOSING
+
+    # Pre-fill assistant turn — model continues from here
     return (
         f"<|im_start|>system\n{system_content}<|im_end|>\n"
         f"<|im_start|>user\n{user_cot}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
+        f"<|im_start|>assistant\n{COT_PREFILL}"
     )
 
 
@@ -111,6 +127,21 @@ def main() -> None:
     )
     model.eval()
     print(f"[model] Ready on {next(model.parameters()).device}")
+
+    # ── Token ID constants (computed once, used in every generate call) ────────
+    # For Qwen2.5, tokenizer.eos_token_id IS <|im_end|> (151645).
+    # Passing that as eos_token_id makes generate() stop after the first label
+    # word + the chat-turn closer — always 2 tokens, never any reasoning.
+    # We use <|endoftext|> (151643) as the true generation stop instead, then
+    # manually truncate at the first <|im_end|> when decoding.
+    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    im_end_id    = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    print(f"[tokens] endoftext_id={endoftext_id}  im_end_id={im_end_id}  "
+          f"(eos_token_id={tokenizer.eos_token_id})")
+    if endoftext_id == im_end_id:
+        # Some tokenizer configs equate these — fall back to eos and warn.
+        print("[warn] endoftext_id == im_end_id — model will stop after first word. "
+              "Check tokenizer config.")
 
     print("\n[data] Loading manifest + frontier prompts...")
     manifest  = load_manifest()
@@ -140,6 +171,18 @@ def main() -> None:
 
     todo = cot_rows
 
+    # Print the first prompt so we can verify COT_CLOSING is present
+    _first = todo[0]
+    _fp    = frontier.get(_first["row_id"])
+    if _fp:
+        _debug_prompt = build_cot_prompt(_fp["system_content"], _fp["user_content"])
+        print(f"\n[debug] First CoT prompt tail (last 400 chars, includes pre-fill):\n"
+              f"{'─'*60}\n"
+              f"{_debug_prompt[-400:]}\n"
+              f"{'─'*60}\n"
+              f"  Pre-fill: {repr(COT_PREFILL[:80])}\n"
+              f"  Model generates FROM the pre-fill onwards.\n")
+
     for row in tqdm(todo, desc="Base CoT", unit="row"):
         rid = row["row_id"]
         fp  = frontier.get(rid)
@@ -162,7 +205,10 @@ def main() -> None:
                 **inputs,
                 max_new_tokens          = MAX_NEW_TOKENS,
                 do_sample               = False,
-                eos_token_id            = tokenizer.eos_token_id,
+                # No eos_token_id — let the model generate until max_new_tokens.
+                # The pre-filled assistant turn means the model reasons freely;
+                # we truncate at <|im_end|> in post-processing to get clean text
+                # and an accurate token_budget.
                 pad_token_id            = tokenizer.eos_token_id,
                 return_dict_in_generate = True,
                 output_scores           = False,
@@ -171,7 +217,14 @@ def main() -> None:
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
-        generated_ids  = output.sequences[0][input_len:]
+        generated_ids = output.sequences[0][input_len:]
+
+        # Truncate at first <|im_end|>: the model closes its assistant turn
+        # naturally there. Tokens after it would be a new spurious turn.
+        im_end_positions = (generated_ids == im_end_id).nonzero(as_tuple=True)[0]
+        if len(im_end_positions) > 0:
+            generated_ids = generated_ids[:im_end_positions[0].item()]
+
         token_budget   = int(generated_ids.shape[0])
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 

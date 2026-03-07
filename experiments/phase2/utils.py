@@ -37,6 +37,7 @@ PRED_FILES = {
     "kimi_k25_nvidia":    PREDICTIONS_DIR / "kimi_k25_nvidia.jsonl",
     "qwen3_32b_groq":     PREDICTIONS_DIR / "qwen3_32b_groq.jsonl",
     "llama33_70b_groq":   PREDICTIONS_DIR / "llama33_70b_groq.jsonl",
+    "gpt_oss_120b_groq":  PREDICTIONS_DIR / "gpt_oss_120b_groq.jsonl",
 }
 
 # Label constants (ground truth integers)
