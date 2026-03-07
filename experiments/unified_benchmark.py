@@ -115,10 +115,16 @@ LLAMA_MODEL  = "llama-3.3-70b-versatile"  # The "Small Thinking Model" for Pass 
 # Choose the active Pass 1 model ID
 ACTIVE_MODEL = GEMINI_MODEL if MODEL_TYPE == "GEMINI" else QWEN_MODEL
 
+# --- Concurrency & Rate Limit Control ---
+# GEN_CONCURRENCY = 4 (Original Parallel)
+# GEN_CONCURRENCY = 1 (Sequential, safe for low-tier keys)
+GEN_CONCURRENCY = 1
+GEN_SLEEP       = 2.0  # Seconds between runs in sequential mode
+
 SAMPLE_COUNTS: Dict[str, int] = {
-    "financebench_normalized.jsonl":    20,   # production: 75
-    "tatqa_normalized_test_gold.jsonl": 20,   # production: 75
-    "finqa_normalized.jsonl":           10,   # production: 50
+    "financebench_normalized.jsonl":    60,   # production: 75
+    "tatqa_normalized_test_gold.jsonl": 60,   # production: 75
+    "finqa_normalized.jsonl":           40,   # production: 50
 }
 RANDOM_SEED = 42
 TOP_K       = 5
@@ -676,10 +682,29 @@ class UnifiedBenchmark:
                     )
 
                 results       = checkpoint.get("results", [])
-                processed_ids = {r["sample_info"]["id"] for r in results}
+                
+                # RECOVERY FIX: Only keep clean records. If a sample had a 
+                # terminal failure, drop it from results so it gets retried.
+                clean_results = []
+                processed_ids = set()
+                sentinels = {"GENERATION_FAILURE", "TIMEOUT_FAILURE"}
+                
+                for r in results:
+                    runs = r.get("runs", {})
+                    # Check if any of the 4 runs hit a terminal failure
+                    any_fail = any(
+                        runs.get(f"run_{i}", {}).get("answer") in sentinels 
+                        for i in range(1, 5)
+                    )
+                    if not any_fail:
+                        clean_results.append(r)
+                        processed_ids.add(r["sample_info"]["id"])
+                
+                results = clean_results
+                
                 logger.info(
-                    f"Checkpoint loaded: {len(processed_ids)} / {len(samples)} "
-                    "samples already processed."
+                    f"Checkpoint loaded: {len(processed_ids)} successful samples. "
+                    f"({len(checkpoint.get('results', [])) - len(processed_ids)} failed samples will be retried)."
                 )
             except Exception as e:
                 logger.warning(f"Could not load checkpoint ({e}). Starting fresh.")
@@ -722,15 +747,27 @@ class UnifiedBenchmark:
             )
             venra_ret["first_pass_miss"] = first_pass_miss
 
+            # --- Run 1-4 Generation Strategy (Throttle-Aware) ---
+            # Using Semaphore(GEN_CONCURRENCY) allows us to switch between parallel (4)
+            # and sequential (1) execution without changing the core function logic.
+            sem = asyncio.Semaphore(GEN_CONCURRENCY)
+
+            async def throttled_run(func, *args):
+                async with sem:
+                    res = await func(*args)
+                    if GEN_CONCURRENCY < 4 and GEN_SLEEP > 0:
+                        await asyncio.sleep(GEN_SLEEP)
+                    return res
+
             try:
                 run_1, run_2, run_3, run_4 = await asyncio.wait_for(
                     asyncio.gather(
-                        self._run_cot(query, baseline_ret["context"]),
-                        self._run_cot(query, venra_ret["context"]),
-                        self._run_pal(query, baseline_ret["context"]),
-                        self._run_pal(query, venra_ret["context"]),
+                        throttled_run(self._run_cot, query, baseline_ret["context"]),
+                        throttled_run(self._run_cot, query, venra_ret["context"]),
+                        throttled_run(self._run_pal, query, baseline_ret["context"]),
+                        throttled_run(self._run_pal, query, venra_ret["context"]),
                     ),
-                    timeout=120.0
+                    timeout=300.0
                 )
             except asyncio.TimeoutError:
                 logger.error(f"Global generation timeout for {query_id}. Marking all as TIMEOUT.")
@@ -741,6 +778,26 @@ class UnifiedBenchmark:
                     "full_response": {"error": "Global timeout"},
                 }
                 run_1 = run_2 = run_3 = run_4 = timeout_resp
+            except Exception as e:
+                logger.error(f"Generation failed for {query_id}: {e}")
+                error_resp = {
+                    "answer":        "GENERATION_FAILURE",
+                    "code_executed": None,
+                    "prompt_tokens": 0,
+                    "full_response": {"error": str(e)},
+                }
+                run_1 = run_2 = run_3 = run_4 = error_resp
+
+            # --- RECOVERY FIX (Phase 2): DO NOT SAVE if any run hit a failure ---
+            # This prevents the checkpoint from being corrupted with generation failures.
+            # Next time we run, these failed samples will be retried automatically.
+            sentinels = {"GENERATION_FAILURE", "TIMEOUT_FAILURE"}
+            any_fail = any(r.get("answer") in sentinels for r in [run_1, run_2, run_3, run_4])
+            
+            if any_fail:
+                logger.warning(f"Generation failure for {query_id}. Sample will NOT be saved to checkpoint.")
+                pbar.update(1)
+                continue
 
             record = {
                 "sample_info": {**sample, "company": sample.get("company")},

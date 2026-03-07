@@ -384,7 +384,7 @@ def get_failure_type(
     # Signal (b): PAL only — None is the sentinel _run_pal writes on crash.
     #             NOT checked for CoT runs; None there means "not applicable".
     # Signal (c): finish_reason reports output truncation (MAX_TOKENS hit).
-    failure_sentinels  = {"GENERATION_FAILURE", "REASONING_FAILURE", "TIMEOUT_FAILURE"}
+    failure_sentinels  = {"GENERATION_FAILURE", "TIMEOUT_FAILURE"}
     truncation_signals = ["MAX_TOKENS", "length", "max_tokens"]
 
     is_pal = run_id in PAL_RUNS
