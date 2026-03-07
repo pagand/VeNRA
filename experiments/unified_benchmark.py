@@ -54,6 +54,12 @@ FIXES (all rounds):
      making both systems look worse and potentially skewing the Run 1/Run 4
      comparison.  The fix: only apply the filter when we have confirmed origin
      evidence; unknown-origin chunks are included with a debug-level log.
+ 12. PAL FAIL-FAST FIX: _run_pal no longer retries on generation failure.
+     A single Pass 1 attempt is made. On any exception reasoning=None and
+     GENERATION_FAILURE is returned immediately. The prior 3-attempt loop
+     with exponential backoff (2s, 4s) wasted up to 6s per PAL call per
+     sample and obscured whether the model can reliably generate at all.
+     Retry logic belongs at the orchestration layer, not inside the benchmark.
 """
 
 import json
@@ -99,20 +105,20 @@ GOLDEN_RECORDS_DIR      = "data/golden_records"
 
 # ── Experiment config ─────────────────────────────────────────────────────────
 # TOGGLE THIS: "GEMINI" or "QWEN"
-MODEL_TYPE = "GEMINI" 
+MODEL_TYPE = "GEMINI"
 
 # Stamped into every checkpoint.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
-QWEN_MODEL   = "qwen/qwen3-32b" # Groq ID for Qwen 3 32B
-LLAMA_MODEL  = "llama-3.3-70b-versatile" # The "Small Thinking Model" for Pass 2
+QWEN_MODEL   = "qwen/qwen3-32b"           # Groq ID for Qwen 3 32B
+LLAMA_MODEL  = "llama-3.3-70b-versatile"  # The "Small Thinking Model" for Pass 2
 
 # Choose the active Pass 1 model ID
 ACTIVE_MODEL = GEMINI_MODEL if MODEL_TYPE == "GEMINI" else QWEN_MODEL
 
 SAMPLE_COUNTS: Dict[str, int] = {
-    "financebench_normalized.jsonl":    2,   # production: 75
-    "tatqa_normalized_test_gold.jsonl": 2,   # production: 75
-    "finqa_normalized.jsonl":           2,   # production: 50
+    "financebench_normalized.jsonl":    20,   # production: 75
+    "tatqa_normalized_test_gold.jsonl": 20,   # production: 75
+    "finqa_normalized.jsonl":           10,   # production: 50
 }
 RANDOM_SEED = 42
 TOP_K       = 5
@@ -185,7 +191,7 @@ class UnifiedBenchmark:
         if not gemini_api_key:
             raise EnvironmentError("GEMINI_API_KEY not found.")
         self._gemini = genai.Client(api_key=gemini_api_key)
-        
+
         # Groq Client (using instructor for structured output)
         from openai import AsyncOpenAI
         import instructor
@@ -252,20 +258,18 @@ class UnifiedBenchmark:
             for line in lines:
                 record = json.loads(line)
                 rec_id = record["id"]
-                
+
                 # FIX: Robust Company Extraction
                 if "company" in record.get("metadata", {}):
-                    # FinanceBench style
                     record["company"] = record["metadata"]["company"]
                 elif ds_name.startswith("finqa") and "/" in rec_id:
-                    # FinQA style (finqa_ADI/2009/...)
                     try:
                         record["company"] = rec_id.split("_")[1].split("/")[0]
                     except:
                         record["company"] = None
                 else:
                     record["company"] = record.get("company")
-                
+
                 if all(get_chunk_id(rec_id, chunk) in indexed_chunk_ids for chunk in record["context_chunks"]):
                     valid_lines.append(line)
             total_eligible += len(valid_lines)
@@ -277,11 +281,10 @@ class UnifiedBenchmark:
                 )
                 continue
 
-            # Deterministic shuffle to ensure diverse datasets but consistent resumption
             rng = random.Random(RANDOM_SEED)
             rng.shuffle(valid_lines)
             sampled = valid_lines[:min(count, len(valid_lines))]
-            
+
             n_dropped = len(lines) - len(valid_lines)
             logger.info(
                 f"{ds_name}: {len(valid_lines)} eligible / {len(lines)} total "
@@ -315,8 +318,7 @@ class UnifiedBenchmark:
         dataset origin.  Chunks absent from chunk_metadata (meta={}) have
         unknown origin and are included rather than falsely dropped.
         """
-        # Sanitize query_id for filesystem safety
-        safe_id = query_id.replace("/", "_")
+        safe_id    = query_id.replace("/", "_")
         cache_path = os.path.join(RETRIEVAL_CACHE_DIR, f"{safe_id}_baseline.json")
         if os.path.exists(cache_path):
             with open(cache_path) as f:
@@ -328,39 +330,25 @@ class UnifiedBenchmark:
             vector_keywords=query.split()[:6],
             reasoning="Baseline vector-only plan — UFL leg disabled.",
         )
-        # BUG 2 FIX: Pass doc_id for scoping fallback
-        # EXPLICIT PARITY: Set include_all_ufl_for_chunks=False to ensure a pure vector baseline.
         results = await self.retriever.retrieve(
-            plan, 
-            k=TOP_K, 
-            doc_id=query_id, 
+            plan,
+            k=TOP_K,
+            doc_id=query_id,
             include_all_ufl_for_chunks=False
         )
 
-        # BUG B FIX: Text Chunk Bleed Detection & Filtering
         text_chunk_bleed = False
-        final_chunks = []
+        final_chunks     = []
 
-        # Map source_ds to record ID prefix
-        # source_ds is like "financebench_normalized.jsonl"
-        # rec_id prefix is "finbench_", "tatqa_", or "finqa_"
         ds_prefix = source_ds.split("_")[0]
         if ds_prefix == "financebench":
             ds_prefix = "finbench"
 
         for c in results.get("text_chunks", []):
             meta = self.chunk_metadata.get(c.id, {})
-            # Check if any parent record belongs to the same dataset family
             chunk_is_from_same_ds = any(
                 r.startswith(ds_prefix) for r in meta.get("source_records", [])
             )
-
-            # BUG 3 FIX: Only filter if we have confirmed origin information.
-            # If meta is empty the chunk is not in chunk_metadata.json —
-            # this happens when a block's UFL extraction failed and ChromaDB
-            # deletion also failed (orphaned vector). We do NOT know its
-            # dataset origin, so we include it rather than risk dropping valid
-            # evidence. A chunk with confirmed cross-dataset origin IS filtered.
             if source_ds and meta and not chunk_is_from_same_ds:
                 text_chunk_bleed = True
                 logger.warning(f"Text Bleed: Chunk {c.id[:8]} not from {ds_prefix}. Filtering.")
@@ -369,18 +357,12 @@ class UnifiedBenchmark:
                 logger.debug(f"Chunk {c.id[:8]} absent from metadata; including with unknown origin.")
             final_chunks.append(c)
 
-        # FIX: Token Efficiency Guard (Issue 5)
-        # Drop chunks with relevance_score=0.0. These are confirmed irrelevant
-        # by the LexicalGate or SmartFilter.
         filtered_chunks = [
             c for c in final_chunks
             if getattr(c, "relevance_score", 1.0) > 0.0
         ]
 
-        context = self.assembler.assemble({
-            "text_chunks": filtered_chunks,
-            "ufl_rows":    [],
-        })
+        context = self.assembler.assemble({"text_chunks": filtered_chunks, "ufl_rows": []})
         payload = {
             "context":             context,
             "prompt_tokens":       _estimate_tokens(context),
@@ -400,52 +382,40 @@ class UnifiedBenchmark:
         BUG 3 FIX: Only filter chunks whose metadata CONFIRMS a different
         dataset origin.  Same rationale as _baseline_context above.
         """
-        # Sanitize query_id for filesystem safety
-        safe_id = query_id.replace("/", "_")
+        safe_id    = query_id.replace("/", "_")
         cache_path = os.path.join(RETRIEVAL_CACHE_DIR, f"{safe_id}_venra.json")
         if os.path.exists(cache_path):
             with open(cache_path) as f:
                 return json.load(f)
 
-        plan    = await self.navigator.navigate(query, doc_id=query_id)
+        plan = await self.navigator.navigate(query, doc_id=query_id)
 
-        # BUG 2 FIX: Entity Fallback (Force scoping if Navigator fails)
         if plan.ufl_query and not plan.ufl_query.entity_ids:
             logger.warning(f"Navigator failed to resolve entity for {query_id}. Scoping to record ID.")
-            # Passing query_id as doc_id to retrieve() handles this via record-scoping logic
 
-        # BUG 2 FIX: pass doc_id and company for scoping
         results = await self.retriever.retrieve(
-            plan, 
-            k=TOP_K, 
+            plan,
+            k=TOP_K,
             doc_id=query_id,
             company=company
         )
 
-        # BUG 2 FIX: UFL Row Cap & Multi-Entity Safeguard
-        ufl_rows = results.get("ufl_rows", [])
-        # DualRetriever.retrieve now handles capping and bleed detection in its meta
-        ufl_bleed = results.get("meta", {}).get("ufl_bleed", False)
+        ufl_rows        = results.get("ufl_rows", [])
+        ufl_bleed       = results.get("meta", {}).get("ufl_bleed", False)
         first_pass_miss = results.get("meta", {}).get("first_pass_miss", False)
 
-        # BUG B FIX: Text Chunk Bleed Detection & Filtering
         text_chunk_bleed = False
-        final_chunks = []
+        final_chunks     = []
 
-        # Map source_ds to record ID prefix
         ds_prefix = source_ds.split("_")[0]
         if ds_prefix == "financebench":
             ds_prefix = "finbench"
 
         for c in results.get("text_chunks", []):
             meta = self.chunk_metadata.get(c.id, {})
-            # Check if any parent record belongs to the same dataset family
             chunk_is_from_same_ds = any(
                 r.startswith(ds_prefix) for r in meta.get("source_records", [])
             )
-
-            # BUG 3 FIX: Only filter if we have confirmed origin information.
-            # See _baseline_context for the full rationale.
             if source_ds and meta and not chunk_is_from_same_ds:
                 text_chunk_bleed = True
                 logger.warning(f"Text Bleed: Chunk {c.id[:8]} not from {ds_prefix}. Filtering.")
@@ -454,16 +424,12 @@ class UnifiedBenchmark:
                 logger.debug(f"Chunk {c.id[:8]} absent from metadata; including with unknown origin.")
             final_chunks.append(c)
 
-        # FIX: Token Efficiency Guard (Issue 5)
         filtered_chunks = [
             c for c in final_chunks
             if getattr(c, "relevance_score", 1.0) > 0.0
         ]
 
-        context = self.assembler.assemble({
-            "text_chunks": filtered_chunks,
-            "ufl_rows":    ufl_rows,
-        })
+        context = self.assembler.assemble({"text_chunks": filtered_chunks, "ufl_rows": ufl_rows})
         payload = {
             "context":             context,
             "prompt_tokens":       _estimate_tokens(context),
@@ -497,7 +463,6 @@ class UnifiedBenchmark:
 
         try:
             if MODEL_TYPE == "GEMINI":
-                # Ensure context is not too large (cap at ~8000 tokens / 30k chars)
                 safe_user_prompt = user_prompt[:30000]
                 prompt_len = _estimate_tokens(safe_user_prompt)
                 logger.info(f"Gemini CoT prompt size: {prompt_len} tokens")
@@ -509,44 +474,49 @@ class UnifiedBenchmark:
                     config=types.GenerateContentConfig(
                         system_instruction=COT_SYSTEM_PROMPT,
                         temperature=0.0,
-                        max_output_tokens=2048,
+                        max_output_tokens=4096,
                     ),
                 )
-                
-                # Robust response checking
+
+                finish_reason = "UNKNOWN"
+                if response and hasattr(response, "candidates") and response.candidates:
+                    finish_reason = str(response.candidates[0].finish_reason)
+
                 if not response or not hasattr(response, "text") or not response.text:
-                    logger.warning(f"Gemini returned empty response for {ACTIVE_MODEL}. Finish reason: {getattr(response, 'candidates', [None])[0]}")
+                    logger.warning(f"Gemini returned empty response for {ACTIVE_MODEL}. Finish reason: {finish_reason}")
                     raw_text = "ERROR: Empty response or safety block"
                 else:
                     raw_text = response.text.strip()
             else:
-                # Use Groq for Qwen
                 response = await self._groq.chat.completions.create(
                     model=ACTIVE_MODEL,
                     messages=[
                         {"role": "system", "content": COT_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
+                        {"role": "user",   "content": user_prompt}
                     ],
                     temperature=0.0,
-                    max_tokens=2048,
-                    response_model=None # Raw text response
+                    max_tokens=4096,
+                    response_model=None
                 )
-                raw_text = response.choices[0].message.content.strip()
+                raw_text     = response.choices[0].message.content.strip()
+                finish_reason = response.choices[0].finish_reason
 
             lines  = raw_text.splitlines()
-            answer = lines[-1].strip() if lines else "REASONING_FAILURE"
+            answer = lines[-1].strip() if lines else "GENERATION_FAILURE"
         except Exception as e:
             logger.error(f"{MODEL_TYPE} CoT error: {e}")
-            answer = "TIMEOUT_FAILURE" if "timeout" in str(e).lower() else "REASONING_FAILURE"
-            raw_text = "ERROR: " + str(e)
+            answer        = "TIMEOUT_FAILURE" if "timeout" in str(e).lower() else "GENERATION_FAILURE"
+            raw_text      = "ERROR: " + str(e)
+            finish_reason = "ERROR"
 
         return {
             "answer":        answer,
             "code_executed": False,
             "prompt_tokens": _estimate_tokens(COT_SYSTEM_PROMPT + "\n\n" + user_prompt),
             "full_response": {
-                "raw_text": raw_text,
-                "reasoning_trace": raw_text
+                "raw_text":        raw_text,
+                "reasoning_trace": raw_text,
+                "finish_reason":   finish_reason,
             },
         }
 
@@ -555,17 +525,23 @@ class UnifiedBenchmark:
         Runs 3 & 4 — The VeNRA Hybrid Architecture.
         Pass 1: Reasoning/Code via ACTIVE_MODEL (Gemini or Qwen).
         Pass 2: Synthesis via LLAMA_MODEL (Llama-3.3-70b via Groq).
+
+        FAIL-FAST: A single Pass 1 attempt is made. On any exception,
+        reasoning=None and GENERATION_FAILURE is returned immediately.
+        No retries, no sleep. If the model cannot generate on the first
+        attempt the sample is marked T7 and the benchmark moves on.
         """
         augmented_context = PAL_CONTEXT_HEADER + context
-        
-        # Pass 1: Reasoning & Code Generation
-        pass_1_prompt = self.agent.pass_1_prompt
-        user_prompt_1 = f"CONTEXT:\n{augmented_context}\n\nQUERY: {query}"
-        
+        pass_1_prompt     = self.agent.pass_1_prompt
+        user_prompt_1     = f"CONTEXT:\n{augmented_context}\n\nQUERY: {query}"
+
+        reasoning       = None
+        last_error      = "Unknown"
+        finish_reason_1 = "UNKNOWN"
+
+        # ── Single attempt — no retry, no sleep ───────────────────────────────
         try:
-            # --- Pass 1: Logic & Code ---
             if MODEL_TYPE == "GEMINI":
-                # Cap context and disable safety blocks for research parity
                 safe_user_prompt_1 = user_prompt_1[:30000]
                 prompt_len_1 = _estimate_tokens(safe_user_prompt_1)
                 logger.info(f"Gemini PAL Pass 1 prompt size: {prompt_len_1} tokens")
@@ -577,77 +553,87 @@ class UnifiedBenchmark:
                     config=types.GenerateContentConfig(
                         system_instruction=pass_1_prompt,
                         temperature=0.0,
-                        max_output_tokens=2048,
+                        max_output_tokens=4096,
                         response_mime_type="application/json",
                         response_schema=AgentReasoning,
                     ),
                 )
-                
-                # Robust parsing
+
+                if reasoning_resp and hasattr(reasoning_resp, "candidates") and reasoning_resp.candidates:
+                    finish_reason_1 = str(reasoning_resp.candidates[0].finish_reason)
+
                 if not reasoning_resp or not hasattr(reasoning_resp, "parsed"):
-                    logger.warning(f"Gemini Pass 1 failed for {ACTIVE_MODEL}. response.parsed is missing.")
-                    reasoning = None
-                else:
-                    reasoning = reasoning_resp.parsed
+                    raise ValueError(f"response.parsed missing. Finish reason: {finish_reason_1}")
+                reasoning = reasoning_resp.parsed
             else:
-                # QWEN via Groq
-                reasoning = await self._groq.chat.completions.create(
+                reasoning, completion = await self._groq.chat.completions.create_with_completion(
                     model=ACTIVE_MODEL,
                     messages=[
                         {"role": "system", "content": pass_1_prompt},
-                        {"role": "user", "content": user_prompt_1}
+                        {"role": "user",   "content": user_prompt_1}
                     ],
                     temperature=0.0,
-                    max_tokens=2048,
+                    max_tokens=4096,
                     response_model=AgentReasoning
                 )
-            
-            # --- Safety Check: Ensure reasoning was parsed successfully ---
-            if not reasoning:
-                raise ValueError(f"Pass 1 model ({ACTIVE_MODEL}) failed to generate reasoning.")
+                finish_reason_1 = completion.choices[0].finish_reason
 
-            # --- Step 2: Execute Code ---
+            if not reasoning:
+                raise ValueError("Empty reasoning generated")
+
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"PAL Pass 1 failed (no retry): {e}")
+            # reasoning remains None → outer try/except returns GENERATION_FAILURE
+
+        try:
+            if not reasoning:
+                raise ValueError(
+                    f"Pass 1 model ({ACTIVE_MODEL}) failed. Last error: {last_error}"
+                )
+
+            # ── Execute Code ──────────────────────────────────────────────────
             code_result = {"output": "No code run", "error": None}
             if reasoning.requires_math and reasoning.python_code:
                 code_result = self.agent.executor.execute(reasoning.python_code)
-            
-            # --- Pass 2: Synthesis (Always LLAMA_MODEL for hybrid architecture) ---
-            user_prompt_2 = f"""
-QUERY: {query}
-CONTEXT: {augmented_context}
-REASONING: {reasoning.plan}
-CODE_OUTPUT: {code_result['output']}
-CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
-"""
+
+            # ── Pass 2: Synthesis ─────────────────────────────────────────────
+            user_prompt_2 = (
+                f"QUERY: {query}\n"
+                f"CONTEXT: {augmented_context}\n"
+                f"REASONING: {reasoning.plan}\n"
+                f"CODE_OUTPUT: {code_result['output']}\n"
+                f"CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}\n"
+            )
             final = await self.agent._call_fast_synthesis(user_prompt_2)
 
             if not final:
                 raise ValueError(f"Pass 2 model ({LLAMA_MODEL}) failed to synthesize.")
 
-            # Package for results
             full = _pydantic_dump(final)
-            full["reasoning_plan"] = reasoning.plan
-            full["python_code"]    = reasoning.python_code
-            full["raw_text"]       = (
+            full["reasoning_plan"]  = reasoning.plan
+            full["python_code"]     = reasoning.python_code
+            full["finish_reason_1"] = finish_reason_1
+            full["raw_text"] = (
                 f"PLAN: {reasoning.plan}\n\n"
                 f"CODE:\n{reasoning.python_code}\n\n"
                 f"FINAL: {final.answer}"
             )
-            
+
             return {
                 "answer":        final.answer,
-                "code_executed": bool(reasoning.python_code and not code_result['error']),
+                "code_executed": bool(reasoning.python_code and not code_result["error"]),
                 "prompt_tokens": _estimate_tokens(augmented_context + query),
                 "full_response": full,
             }
-            
+
         except Exception as e:
             logger.error(f"Hybrid PAL error: {e}")
             return {
-                "answer": "REASONING_FAILURE",
-                "code_executed": False,
+                "answer":        "GENERATION_FAILURE",
+                "code_executed": None,   # Sentinel: tells extract_metrics this is T7
                 "prompt_tokens": 0,
-                "full_response": {"error": str(e), "raw_text": f"ERROR: {e}"}
+                "full_response": {"error": str(e), "raw_text": f"ERROR: {e}"},
             }
 
     # ── Benchmark loop ────────────────────────────────────────────────────────
@@ -658,15 +644,14 @@ CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
             logger.error("No eligible samples found. Aborting benchmark.")
             return
 
-        # ── Checkpoint loading ─────────────────────────────────────────────────
         results: List[Dict[str, Any]] = []
         processed_ids: set            = set()
 
         current_config = {
-            "gemini_model":   GEMINI_MODEL,
-            "sample_counts":  SAMPLE_COUNTS,
-            "random_seed":    RANDOM_SEED,
-            "top_k":          TOP_K,
+            "gemini_model":  GEMINI_MODEL,
+            "sample_counts": SAMPLE_COUNTS,
+            "random_seed":   RANDOM_SEED,
+            "top_k":         TOP_K,
         }
 
         if os.path.exists(GENERATION_RESULTS_PATH):
@@ -706,12 +691,9 @@ CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
             f"Remaining        : {remaining}"
         )
 
-        # ── Main loop (Persistent Accumulation) ─────────────────────────────
         pbar = tqdm(total=len(samples), desc="Benchmark Progress")
-        
-        # Initialize with ALL previous results to prevent data loss
+
         final_results: List[Dict[str, Any]] = list(results)
-        # Map for quick lookup of what we ALREADY HAVE in the file
         existing_ids = {r["sample_info"]["id"] for r in final_results}
 
         for i, sample in enumerate(samples):
@@ -719,36 +701,28 @@ CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
             source_ds = sample.get("source_ds", "")
 
             if query_id in existing_ids:
-                # Find the existing record to show in progress (optional but helpful)
                 pbar.update(1)
                 pbar.set_postfix({"id": query_id[:8], "status": "exists"})
                 continue
 
-            # Retrieval is cached to disk — zero API cost on re-run.
             raw_company = sample.get("company")
-            # Canonicalise: 'Best Buy' -> 'ID_BEST_BUY' to match the indexer
-            company_id = self._company_to_entity_id(raw_company) if raw_company else None
-            
+            company_id  = self._company_to_entity_id(raw_company) if raw_company else None
+
             baseline_ret, venra_ret = await asyncio.gather(
                 self._baseline_context(query, query_id, source_ds),
                 self._venra_context(query, query_id, source_ds, company=company_id),
             )
-            
-            # ... (rest of the retrieval logic)
-            # BUG 3 FIX: Navigator Rescue Rate (First Pass Miss)
-            # Fires when the baseline (vector-only) retrieval results in 0 usable
-            # chunks due to the Lexical Gate, but VeNRA's Navigator rescues 
-            # the query by providing a hypothesis that passes the gate.
+
             first_pass_miss = (
                 len(baseline_ret.get("retrieved_chunk_ids", [])) == 0 and
-                (len(venra_ret.get("retrieved_chunk_ids", [])) > 0 or len(venra_ret.get("ufl_row_ids", [])) > 0)
+                (
+                    len(venra_ret.get("retrieved_chunk_ids", [])) > 0 or
+                    len(venra_ret.get("ufl_row_ids", [])) > 0
+                )
             )
-            # Inject into the record for the extractor to pick up
             venra_ret["first_pass_miss"] = first_pass_miss
 
-            # Always re-run all 4 to ensure consistent model throughout matrix
             try:
-                # Increased timeout to 120s for complex reasoning tasks
                 run_1, run_2, run_3, run_4 = await asyncio.wait_for(
                     asyncio.gather(
                         self._run_cot(query, baseline_ret["context"]),
@@ -761,10 +735,10 @@ CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
             except asyncio.TimeoutError:
                 logger.error(f"Global generation timeout for {query_id}. Marking all as TIMEOUT.")
                 timeout_resp = {
-                    "answer": "TIMEOUT_FAILURE", 
-                    "code_executed": False, 
-                    "prompt_tokens": 0, 
-                    "full_response": {"error": "Global timeout"}
+                    "answer":        "TIMEOUT_FAILURE",
+                    "code_executed": False,
+                    "prompt_tokens": 0,
+                    "full_response": {"error": "Global timeout"},
                 }
                 run_1 = run_2 = run_3 = run_4 = timeout_resp
 
@@ -789,8 +763,6 @@ CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
                     "run_4": run_4,
                 },
             }
-            
-            # Token parity is already set in record above, removing redundant block
 
             final_results.append(record)
 
@@ -800,7 +772,7 @@ CODE_ERROR: {code_result['error'] if code_result['error'] else 'None'}
                     f,
                     indent=2,
                 )
-            
+
             pbar.update(1)
             pbar.set_postfix({"id": query_id[:8]})
 
