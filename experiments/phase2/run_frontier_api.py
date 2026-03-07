@@ -11,22 +11,15 @@ DEFAULT: runs on the 92-row CoT subsample (cot_subsample=True, pair pools only).
 Use --full to run all 812 test rows (needed for full composite M).
 
 Supported models (--model flag):
-  gemini        → gemini-3-flash-preview      via google-genai
-  kimi          → moonshotai/kimi-k2.5        via NVIDIA NIM
-  qwen3         → qwen/qwen3-32b              via Groq
-  llama70b      → llama-3.3-70b-versatile     via Groq
-  gpt_oss_120b  → openai/gpt-oss-120b         via Groq
-
-If a model is skipped entirely, compute_metrics.py silently skips it —
-all other models still produce valid results.
-
-Usage (laptop, serving .env):
-  python -m experiments.phase2.run_frontier_api --model gemini
-  python -m experiments.phase2.run_frontier_api --model kimi
-  python -m experiments.phase2.run_frontier_api --model qwen3
-  python -m experiments.phase2.run_frontier_api --model llama70b
-  python -m experiments.phase2.run_frontier_api --model gpt_oss_120b
-  python -m experiments.phase2.run_frontier_api --model gemini --full
+  Strict (1 token, zero-shot):
+    gemini25      → gemini-2.5-flash            via google-genai
+    kimi          → moonshotai/kimi-k2.5        via NVIDIA NIM
+    llama70b      → llama-3.3-70b-versatile     via Groq
+  
+  Flexible (Up to MAX_EXTRA_TOKENS, allows mandatory logic/markdown):
+    gemini3       → gemini-3-flash-preview      via google-genai
+    qwen3         → qwen/qwen3-32b              via Groq
+    gpt_oss_120b  → openai/gpt-oss-20b          via Groq
 """
 
 import argparse
@@ -37,6 +30,7 @@ import math
 import os
 import sys
 import time
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -58,54 +52,113 @@ from experiments.phase2.utils import (
     ALL_PAIR_TAGS, PRED_FILES,
 )
 
+# ── Global Inference Configuration ────────────────────────────────────────────
+# The maximum allowed tokens for flexible models that enforce invisible thought 
+# blocks or markdown formatting. 100 is enough to bypass limits but small 
+# enough to prevent full Chain-of-Thought cheating.
+MAX_EXTRA_TOKENS = 100
+
 # ── Model registry ────────────────────────────────────────────────────────────
 MODEL_CONFIGS = {
-    "gemini":       {"pred_key": "gemini_3_flash",    "display": "gemini-3-flash-preview"},
+    # Original Strict Models
+    "gemini25":     {"pred_key": "gemini_25_flash",   "display": "gemini-2.5-flash"},
     "kimi":         {"pred_key": "kimi_k25_nvidia",   "display": "moonshotai/kimi-k2.5"},
-    "qwen3":        {"pred_key": "qwen3_32b_groq",    "display": "qwen/qwen3-32b"},
     "llama70b":     {"pred_key": "llama33_70b_groq",  "display": "llama-3.3-70b-versatile"},
-    "gpt_oss_120b": {"pred_key": "gpt_oss_120b_groq", "display": "openai/gpt-oss-120b"},
+    
+    # New Flexible Models
+    "gemini3":      {"pred_key": "gemini_3_flash",    "display": "gemini-3-flash-preview"},
+    "qwen3":        {"pred_key": "qwen3_32b_groq",    "display": "qwen/qwen3-32b"},
+    "gpt_oss_120b": {"pred_key": "gpt_oss_120b_groq", "display": "openai/gpt-oss-20b"},
 }
 
 SEMAPHORE_LIMITS = {
-    "gemini":         2,
-    "kimi":           2,   # NVIDIA NIM free tier is strict; 4 causes 429s
-    "qwen3":          2,
+    "gemini25":       2,
+    "kimi":           2,
     "llama70b":       2,
+    "gemini3":        2,
+    "qwen3":          2,
     "gpt_oss_120b":   2,
 }
 
+# ── Clean & Extract Helper ────────────────────────────────────────────────────
+def clean_and_count(raw: str) -> Tuple[str, int]:
+    """
+    Strips <think> blocks and Markdown. Finds the verdict keyword.
+    Counts 'extra' tokens (words/punctuation) generated BEFORE the verdict.
+    """
+    if not raw:
+        return "", 0
+        
+    # 1. Strip <think> blocks safely
+    cleaned = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
+    if "</think>" not in cleaned and "<think>" in cleaned:
+        # Cut off during thinking, no verdict given
+        return "", len(re.findall(r'\w+|[^\w\s]', raw))
+
+    # 2. Strip Markdown bolding/italics
+    cleaned = cleaned.replace('**', '').replace('*', '')
+
+    # 3. Find verdict to isolate tokens generated before it
+    # Maps directly to the labels parse_response looks for (including general)
+    match = re.search(r'(?i)(found|supported|fake|unfounded|general)', cleaned)
+    
+    if match:
+        # Extract text up to and including the verdict (e.g., "Label: Fake")
+        text_up_to_verdict = cleaned[:match.end()]
+        
+        # Simple token approximation: count words and punctuation characters
+        total_tokens = len(re.findall(r'\w+|[^\w\s]', text_up_to_verdict))
+        
+        # Extra tokens = Total tokens MINUS the 1 token used for the verdict itself
+        extra_tokens = max(0, total_tokens - 1)
+        
+        # Final cleanup to assist the parser (remove common prefaces)
+        final_clean = re.sub(r'(?i)^(label\s*:?\s*)', '', cleaned.strip()).strip()
+        return final_clean, extra_tokens
+    else:
+        # Model failed to output a valid verdict keyword.
+        final_clean = re.sub(r'(?i)^(label\s*:?\s*)', '', cleaned.strip()).strip()
+        all_tokens = len(re.findall(r'\w+|[^\w\s]', cleaned))
+        return final_clean, all_tokens
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
-def build_gemini_caller():
+def build_gemini_caller(model_name: str, max_t: int, strict: bool):
     from google import genai
     from google.genai import types
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GOOGLE_API_KEY not set in .env")
+        raise ValueError("GEMINI_API_KEY not set in .env")
     client = genai.Client(api_key=api_key)
 
-    async def call(system_content: str, user_content: str) -> Tuple[str, float]:
+    async def call(system_content: str, user_content: str) -> Tuple[str, str, float, int]:
         try:
             cfg_kwargs = {
                 "system_instruction": system_content,
-                "max_output_tokens": 1,
+                "max_output_tokens": max_t,
                 "temperature": 0.0,
             }
-            try:
-                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-            except Exception:
-                pass
+            if strict:
+                try:
+                    cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                except Exception:
+                    pass
+            
             response = await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-3-flash-preview",
+                model=model_name,
                 contents=user_content,
                 config=types.GenerateContentConfig(**cfg_kwargs),
             )
             raw = response.text or ""
-            return raw, 0.5
+            
+            if strict:
+                return raw, raw, 0.5, 0
+            else:
+                cleaned, extra_tokens = clean_and_count(raw)
+                return raw, cleaned, 0.5, extra_tokens
+            
         except Exception as e:
             raise RuntimeError(f"Gemini error: {e}") from e
 
@@ -124,7 +177,7 @@ def build_kimi_caller():
 
     @retry(
         stop=stop_after_attempt(5),
-        wait=wait_random_exponential(min=5, max=60),  # longer backoff for 429s
+        wait=wait_random_exponential(min=5, max=60),
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
@@ -135,7 +188,7 @@ def build_kimi_caller():
             headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
             json={
                 "model": "moonshotai/kimi-k2.5",
-                "messages": [
+                "messages":[
                     {"role": "system", "content": system_content},
                     {"role": "user",   "content": user_content},
                 ],
@@ -148,24 +201,25 @@ def build_kimi_caller():
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
-    async def call(system_content: str, user_content: str) -> Tuple[str, float]:
+    async def call(system_content: str, user_content: str) -> Tuple[str, str, float, int]:
         raw = await asyncio.to_thread(_sync_call, system_content, user_content)
-        return raw, 0.5
+        # Kimi natively obeys strict 1-token settings. No cleaning overhead.
+        return raw, raw, 0.5, 0
 
     return call
 
 
 # ── Groq models ───────────────────────────────────────────────────────────────
 
-def build_groq_caller(model_id: str, prepend_no_think: bool = False):
+def build_groq_caller(model_id: str, max_t: int, strict: bool, res_effort: str = None):
     from openai import AsyncOpenAI
 
     groq_keys = settings.GROQ_KEYS
     if not groq_keys:
         raise ValueError("No GROQ_API_KEY found in .env")
 
-    clients = [
-        AsyncOpenAI(base_url="https://api.groq.com/openai/v1", api_key=k, timeout=30.0)
+    clients =[
+        AsyncOpenAI(base_url="https://api.groq.com/openai/v1", api_key=k, timeout=60.0)
         for k in groq_keys
     ]
     client_cycle = itertools.cycle(clients)
@@ -176,31 +230,44 @@ def build_groq_caller(model_id: str, prepend_no_think: bool = False):
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    async def call(system_content: str, user_content: str) -> Tuple[str, float]:
+    async def call(system_content: str, user_content: str) -> Tuple[str, str, float, int]:
         client = next(client_cycle)
-        sys_msg = ("/no_think\n" + system_content) if prepend_no_think else system_content
 
-        response = await client.chat.completions.create(
-            model=model_id,
-            messages=[
-                {"role": "system", "content": sys_msg},
+        kwargs = {
+            "model": model_id,
+            "messages":[
+                {"role": "system", "content": system_content},
                 {"role": "user",   "content": user_content},
             ],
-            max_tokens  = 1,
-            temperature = 0.0,
-            logprobs    = True,
-        )
+            "max_tokens": max_t,
+            "temperature": 0.0,
+        }
+        
+        # Apply reasoning effort if required by API constraints
+        if res_effort:
+            kwargs["extra_body"] = {"reasoning_effort": res_effort}
+
+        # Logprobs only requested on strict models to prevent API crashes on reasoning wrappers
+        if strict and max_t == 1 and not model_id.startswith("llama"):
+            kwargs["logprobs"] = True
+
+        response = await client.chat.completions.create(**kwargs)
         raw = response.choices[0].message.content or ""
 
         conf = 0.5
-        try:
-            lp = response.choices[0].logprobs.content
-            if lp:
-                conf = math.exp(lp[0].logprob)
-        except Exception:
-            pass
+        if strict and max_t == 1:
+            try:
+                lp = response.choices[0].logprobs.content
+                if lp:
+                    conf = math.exp(lp[0].logprob)
+            except Exception:
+                pass
 
-        return raw, conf
+        if strict:
+            return raw, raw, conf, 0
+        else:
+            cleaned, extra_tokens = clean_and_count(raw)
+            return raw, cleaned, conf, extra_tokens
 
     return call
 
@@ -230,7 +297,7 @@ async def run_model(
         return
 
     sem      = asyncio.Semaphore(sem_limit)
-    errors: List[int] = []
+    errors: List[int] =[]
     lock     = asyncio.Lock()
     done_count = 0
 
@@ -247,30 +314,36 @@ async def run_model(
         async with sem:
             t0 = time.perf_counter()
             try:
-                raw, conf = await call_fn(fp["system_content"], fp["user_content"])
+                # Retrieve raw string (for saving), cleaned string (for parsing), and extra token count
+                raw, cleaned, conf, extra_tokens = await call_fn(fp["system_content"], fp["user_content"])
                 t1 = time.perf_counter()
-                pred, valid = parse_response(raw)
+                
+                # Pass ONLY the cleaned text to the parser
+                pred, valid = parse_response(cleaned)
+                
                 write_prediction(out_file, {
-                    "row_id":     rid,
-                    "pred":       pred,
-                    "valid":      valid,
-                    "raw":        raw,
-                    "confidence": round(conf, 6),
-                    "latency_ms": round((t1 - t0) * 1000, 3),
-                    "model":      model_key,
+                    "row_id":       rid,
+                    "pred":         pred,
+                    "valid":        valid,
+                    "raw":          raw, # Preserves exactly what the API generated
+                    "confidence":   round(conf, 6),
+                    "latency_ms":   round((t1 - t0) * 1000, 3),
+                    "extra_tokens": extra_tokens, # Tokens used before reaching the verdict
+                    "model":        model_key,
                 })
+                
                 async with lock:
                     done_count += 1
                     pct = 100 * done_count / len(todo)
-                    status = f"valid={valid} pred={pred}"
-                    print(f"  [{done_count:>3}/{len(todo)}  {pct:5.1f}%]  "
+                    status = f"valid={valid} pred={pred} extra_toks={extra_tokens}"
+                    print(f"[{done_count:>3}/{len(todo)}  {pct:5.1f}%]  "
                           f"row {rid:>4}  {t1-t0:5.1f}s  {status}")
             except Exception as e:
                 t1 = time.perf_counter()
                 async with lock:
                     done_count += 1
                     pct = 100 * done_count / len(todo)
-                    print(f"  [{done_count:>3}/{len(todo)}  {pct:5.1f}%]  "
+                    print(f"[{done_count:>3}/{len(todo)}  {pct:5.1f}%]  "
                           f"row {rid:>4}  ERROR: {e}")
                     errors.append(rid)
                 write_prediction(error_file, {
@@ -310,25 +383,41 @@ def main() -> None:
     print(f"\n[run] Model  : {cfg['display']}")
     print(f"[run] Scope  : {'FULL test set (812 rows)' if full_run else 'CoT subsample (92 rows) — add --full for all 812'}")
 
-    if model_key == "gemini":
-        call_fn = build_gemini_caller()
+    # Set up specialized routes based on strict vs flexible parsing constraints
+    if model_key == "gemini25":
+        # Strict 1-token model
+        call_fn = build_gemini_caller("gemini-2.5-flash", max_t=1, strict=True)
+        
     elif model_key == "kimi":
+        # Native strict 1-token model
         call_fn = build_kimi_caller()
-    elif model_key == "qwen3":
-        call_fn = build_groq_caller("qwen/qwen3-32b", prepend_no_think=True)
+        
     elif model_key == "llama70b":
-        call_fn = build_groq_caller("llama-3.3-70b-versatile", prepend_no_think=False)
+        # Strict 1-token model
+        call_fn = build_groq_caller("llama-3.3-70b-versatile", max_t=1, strict=True)
+        
+    elif model_key == "gemini3":
+        # Flexible model (needs tokens to bypass invisible thought blocks)
+        call_fn = build_gemini_caller("gemini-3-flash-preview", max_t=MAX_EXTRA_TOKENS, strict=False)
+        
+    elif model_key == "qwen3":
+        # Flexible model (needs tokens for markdown/thinking format)
+        call_fn = build_groq_caller("qwen/qwen3-32b", max_t=MAX_EXTRA_TOKENS, strict=False, res_effort="none")
+        
     elif model_key == "gpt_oss_120b":
-        call_fn = build_groq_caller("openai/gpt-oss-120b", prepend_no_think=False)
+        # Flexible model (needs tokens for mandatory "low" reasoning effort wrapper)
+        call_fn = build_groq_caller("openai/gpt-oss-20b", max_t=MAX_EXTRA_TOKENS, strict=False, res_effort="low")
 
     manifest = load_manifest()
     frontier = load_prompts_frontier()
+    
+    # Automatically maps to exactly what compute_metrics.py expects
     out_file = PRED_FILES[cfg["pred_key"]]
 
     if full_run:
         rows = manifest
     else:
-        rows = [
+        rows =[
             r for r in manifest
             if r.get("cot_subsample", False) and r["pool"] in ALL_PAIR_TAGS
         ]

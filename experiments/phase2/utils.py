@@ -34,6 +34,7 @@ PRED_FILES = {
     "base_qwen_zeroshot": PREDICTIONS_DIR / "base_qwen_zeroshot.jsonl",
     "base_qwen_cot":      PREDICTIONS_DIR / "base_qwen_cot.jsonl",
     "gemini_3_flash":     PREDICTIONS_DIR / "gemini_3_flash.jsonl",
+    "gemini_25_flash":     PREDICTIONS_DIR / "gemini_25_flash.jsonl",
     "kimi_k25_nvidia":    PREDICTIONS_DIR / "kimi_k25_nvidia.jsonl",
     "qwen3_32b_groq":     PREDICTIONS_DIR / "qwen3_32b_groq.jsonl",
     "llama33_70b_groq":   PREDICTIONS_DIR / "llama33_70b_groq.jsonl",

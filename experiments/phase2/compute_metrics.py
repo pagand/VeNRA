@@ -67,11 +67,14 @@ ALL_MODELS = [
 # Subsample-only models — ran on the 92-row CoT subsample, flip rate only.
 # Frontier API models default to subsample (cost/comparability).
 # If a model file is missing it is silently skipped everywhere.
-FRONTIER_MODELS = [
-    ("gemini_3_flash",    "Gemini-3-Flash-Preview"),
+FRONTIER_MODELS =[
+    # Original strict 1-token models
+    ("gemini_25_flash",   "Gemini-2.5-Flash"),
     ("kimi_k25_nvidia",   "Kimi K2.5 (NVIDIA NIM)"),
-    ("qwen3_32b_groq",    "Qwen3-32B (Groq)"),
     ("llama33_70b_groq",  "Llama 3.3 70B (Groq)"),
+    # New flexible models
+    ("gemini_3_flash",    "Gemini-3-Flash-Preview"),
+    ("qwen3_32b_groq",    "Qwen3-32B (Groq)"),
     ("gpt_oss_120b_groq", "GPT-OSS-120B (Groq)"),
 ]
 
