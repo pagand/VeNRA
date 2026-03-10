@@ -24,9 +24,11 @@
   <img src="https://img.shields.io/badge/Model-LoRA_Adapter-green?logo=huggingface&logoColor=white">
 </a>
 
-</p>
+<a href="https://huggingface.co/pagand/venra">
+ <img src="https://img.shields.io/github/stars/pagand/REPO?style=social">
+</a>
 
-<img src="https://img.shields.io/github/stars/USERNAME/REPO?style=social">
+</p>
 
 VeNRA is an agentic **Financial one-turn QA System** designed to solve the "Stochastic Inaccuracy" problem in Large Language Models. It enables users to ask complex numerical questions about complex financial data such as 10-K filings (e.g., *"What was the Debt-to-Equity ratio in 2026?"*) and receive answers that are **mathematically deterministic**, **fully traceable**, and **audited in real-time**.
 
