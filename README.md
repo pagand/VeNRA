@@ -2,21 +2,13 @@
 
 > **"Trust, but Verify."** — The core philosophy of Financial AI.
 
-VeNRA is an experimental **Financial QA System** designed to solve the "Stochastic Inaccuracy" problem in Large Language Models. It enables users to ask complex numerical questions about 10-K filings (e.g., *"What was the Debt-to-Equity ratio in 2023?"*) and receive answers that are **mathematically deterministic**, **fully traceable**, and **audited in real-time**.
+<img src="assets/structure.webp" align="center" width="50%"/> 
 
-## 🔴 The Problem
-
-Standard RAG (Retrieval-Augmented Generation) pipelines fail in high-stakes financial contexts due to three fundamental limitations:
-
-1.  **The Token Neighbor Problem:** LLMs often hallucinate numbers because "Million" and "Billion" are semantically close in vector space.
-2.  **Context Soup:** When retrieving multiple years of data, LLMs struggle to bind specific numbers to specific dates ("Needle in a Haystack" failure).
-3.  **Arithmetic Incompetence:** LLMs emulate the *language* of math, not the *logic* of math. They cannot reliably calculate ratios or percentages.
-
-In finance, a 99% accuracy rate results in 0% trust.
+VeNRA is an agentic **Financial one-turn QA System** designed to solve the "Stochastic Inaccuracy" problem in Large Language Models. It enables users to ask complex numerical questions about complex financial data such as 10-K filings (e.g., *"What was the Debt-to-Equity ratio in 2026?"*) and receive answers that are **mathematically deterministic**, **fully traceable**, and **audited in real-time**.
 
 ## 🟢 The VeNRA Solution
 
-VeNRA moves beyond simple "Text Retrieval" to a **Hybrid Neuro-Symbolic Architecture**. instead of asking the LLM to *guess* the answer, we empower it to *calculate* the answer using verifiable data.
+VeNRA moves beyond simple "Text Retrieval" to a **Hybrid Neuro-Symbolic Architecture**. instead of asking the LLM to *output* the answer, we empower it with verifiable *structured facts* to *calculate* the answer.
 
 ### Key Features
 
@@ -151,3 +143,13 @@ This project is an active research prototype. We welcome contributions, especial
 Please reach out to us for enterprise and commercial licensing. Contact us at info@upaspro.com.
 
 This project is licensed under the terms of the license included here [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+
+## 💬 How to Cite
+```
+ @article{agandneuro,
+  title={Neuro-Symbolic Financial Reasoning via Deterministic Fact Ledgers and Adversarial Low-Latency Hallucination Detector},
+  author={Agand, Pedram},
+  journal={arXiv preprint arXiv:2603.04663},
+  year={2026}
+}
+```
