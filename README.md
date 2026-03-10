@@ -2,7 +2,9 @@
 
 > **"Trust, but Verify."** — The core philosophy of Financial AI.
 
-<img src="assets/structure.webp" align="center" width="50%"/> 
+<p align="center">
+  <img src="assets/structure.webp" alt="Project Structure" width="50%">
+</p>
 
 VeNRA is an agentic **Financial one-turn QA System** designed to solve the "Stochastic Inaccuracy" problem in Large Language Models. It enables users to ask complex numerical questions about complex financial data such as 10-K filings (e.g., *"What was the Debt-to-Equity ratio in 2026?"*) and receive answers that are **mathematically deterministic**, **fully traceable**, and **audited in real-time**.
 
