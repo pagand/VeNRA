@@ -1,9 +1,9 @@
 # VeNRA: Verifiable Numerical Reasoning Agent
 
-> **"Trust, but Verify."** — The core philosophy of Financial AI.
+> **"Trust, but Verify." — The core philosophy of Financial AI**
 
 <p align="center">
-  <img src="assets/structure.webp" alt="Project Structure" width="50%">
+  <img src="assets/structure.webp" alt="VeNRA Architecture" width="55%">
 </p>
 
 <p align="center">
@@ -17,56 +17,127 @@
 </a>
 
 <a href="https://huggingface.co/spaces/pagand/VeNRA_halDet">
-  <img src="https://img.shields.io/badge/Demo-HuggingFace_Space-blue?logo=huggingface&logoColor=white">
+  <img src="https://img.shields.io/badge/Demo-HuggingFace%20Space-blue?logo=huggingface&logoColor=white">
 </a>
 
 <a href="https://huggingface.co/pagand/venra">
-  <img src="https://img.shields.io/badge/Model-LoRA_Adapter-green?logo=huggingface&logoColor=white">
+  <img src="https://img.shields.io/badge/Model-LoRA%20Adapter-green?logo=huggingface&logoColor=white">
 </a>
 
-<a href="https://huggingface.co/pagand/venra">
- <img src="https://img.shields.io/github/stars/pagand/REPO?style=social">
+<a href="https://github.com/pagand/VeNRA/stargazers">
+ <img src="https://img.shields.io/github/stars/pagand/VeNRA?style=social">
 </a>
 
 </p>
 
-VeNRA is an agentic **Financial one-turn QA System** designed to solve the "Stochastic Inaccuracy" problem in Large Language Models. It enables users to ask complex numerical questions about complex financial data such as 10-K filings (e.g., *"What was the Debt-to-Equity ratio in 2026?"*) and receive answers that are **mathematically deterministic**, **fully traceable**, and **audited in real-time**.
+---
 
-## 🟢 The VeNRA Solution
+## Overview
 
-VeNRA moves beyond simple "Text Retrieval" to a **Hybrid Neuro-Symbolic Architecture**. instead of asking the LLM to *output* the answer, we empower it with verifiable *structured facts* to *calculate* the answer.
+**VeNRA (Verifiable Numerical Reasoning Agent)** is a **neuro-symbolic financial reasoning system** designed to eliminate hallucinated numerical outputs from Large Language Models.
 
-### Key Features
+Traditional Retrieval-Augmented Generation (RAG) systems struggle in **deterministic domains like finance** because:
 
-*   **🛡️ Zero-Hallucination Math:** Arithmetic is performed by deterministic code execution, not by predicting the next token.
-*   **🔗 Deep Traceability:** Every number in an answer is explicitly linked to a specific row in the financial statements and a specific text chunk in the source PDF.
-*   **🤖 The Sentinel (Audit Layer):** A specialized "Judge" model reviews every answer against the source data before it is shown to the user, providing a "Groundedness Score" for confidence.
-*   **⚡ Hybrid Retrieval:** Combines semantic search (for concepts) with structured filtering (for precise metrics) to ensure the right data is found every time.
+* LLMs are **probabilistic token predictors**, not arithmetic engines
+* Dense retrieval introduces **semantic conflation** (e.g. *Net Income* vs *Net Sales*)
+* Minor numerical errors destroy operational trust
 
-## 🚀 Getting Started
+VeNRA addresses these limitations through a **hybrid architecture that separates reasoning from computation** and introduces an **independent auditing layer**.
+
+The system enables users to ask complex financial questions such as:
+
+> *"How much the sale excluding acquisition increase compare to last year and what it was due to?"*
+
+and receive answers that are:
+
+* **Mathematically deterministic**
+* **Fully traceable**
+* **Audited in real time**
+
+---
+
+## Key Features
+
+### 🧮 Deterministic Numerical Reasoning
+All arithmetic is executed through **Python code generation and execution**, not token prediction.
+
+### 🔎 Universal Fact Ledger (UFL)
+Financial statements are parsed into a **typed variable ledger**, replacing probabilistic document retrieval.
+
+### 🔗 Full Traceability
+Every numeric answer is linked to:
+
+* the exact **financial statement row**
+* the **source document span**
+* the **computation trace**
+
+### 🛡 Sentinel Hallucination Detector
+A lightweight **3B parameter forensic model** audits reasoning traces before answers are returned.
+
+### ⚡ Hybrid Retrieval
+Combines:
+
+* lexical filtering (exact financial metrics)
+* semantic search (concept discovery)
+
+to prevent vector-space conflation.
+
+---
+
+## Architecture
+
+VeNRA is built around three modular components:
+
+### 1. Ingestion Engine
+Parses financial PDFs into a structured **Universal Fact Ledger** with strict schema validation.
+
+### 2. Runtime Agent
+A **Program-Aided LLM agent** generates deterministic Python programs that compute answers from ledger variables.
+
+### 3. Sentinel Service
+A separate **forensic auditing model** that verifies reasoning traces and produces a groundedness score.
+
+---
+
+## Installation
 
 ### Prerequisites
-*   Python 3.11+
-*   API Keys (for reasoning, parsing, monitoring).
 
-### Installation
+* Python **3.11+**
+* API keys for reasoning and monitoring services
 
-1.  **Clone the Repository:**
-    ```bash
-    git clone https://github.com/pagand/VeNRA.git
-    cd VeNRA
-    ```
-2.   **Configure:**
-    Create a `.env` file in the root directory:
-    ```bash
-    cp .env.example .env && nano .env # update with your credential
-    ```
+---
 
+### Clone Repository
 
-3.  **Set Up Environment:**
-We have different dependencies for each phase (1) training and (2) serving. You do not have to install both. 
+```bash
+git clone https://github.com/pagand/VeNRA.git
+cd VeNRA
+````
 
-#### Option 1: Automatic (for training only)
+---
+
+### Configure Environment
+
+```bash
+cp .env.example .env
+```
+
+Add your API credentials to `.env`.
+
+---
+
+## Environment Setup
+
+Dependencies differ between **training** and **serving**.
+
+You only need one depending on your goal.
+
+---
+
+# Training Environment
+
+### Automatic Setup
 
 ```bash
 chmod +x setup.sh
@@ -74,31 +145,38 @@ chmod +x setup.sh
 source .venv/bin/activate
 ```
 
-#### Option 2: Manual (for training)
+---
 
-3.1. Create virtual environment
+### Manual Setup
+
+Create environment
+
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 ```
 
-3.2. Upgrade pip
+Upgrade tooling
+
 ```bash
 pip install --upgrade pip setuptools wheel
 ```
 
-3.3. Install PyTorch (for CUDA>13.0)
+Install PyTorch
+
 ```bash
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-    --index-url https://download.pytorch.org/whl/cu124
+--index-url https://download.pytorch.org/whl/cu124
 ```
 
-3.4. Install remaining dependencies
+Install low-level dependencies
+
 ```bash
 pip install triton==3.1.0 bitsandbytes==0.43.3
 ```
 
-3.5. Verify installation
+Verify installation
+
 ```bash
 python << 'EOF'
 import torch, bitsandbytes as bnb, triton
@@ -110,69 +188,130 @@ print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
 EOF
 ```
 
-3.6. Install remaining dependencies
+Install remaining dependencies
+
 ```bash
 pip install -r requirements_training.txt
 ```
 
-#### Option 3: Manual (for serving)
-3.1. Create virtual environment
+---
+
+# Serving Environment
+
+Create environment
+
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 ```
 
-3.2. Install remaining dependencies
+Install dependencies
+
 ```bash
 pip install -r requirements_serving.txt
 ```
 
-4.  (for training): **Start training**
+Run the service
+
 ```bash
-python3 src/hal_det/training/train.py --output_dir ./data/outputs
+uvicorn venra.main:app --reload --app-dir src
 ```
 
-# Quick test (1% of epoch)
+The API will be available at
+
+```
+http://localhost:8000
+```
+
+---
+
+## Training the Sentinel Model
+
+Start training
+
+```bash
+python src/hal_det/training/train.py --output_dir ./data/outputs
+```
+
+Quick test run
+
 ```bash
 python src/hal_det/training/train.py --output_dir ./test --num_train_epochs 0.01
 ```
 
+Resume from checkpoint
 
-# Resume from checkpoint
 ```bash
-python src/hal_det/training/train.py --output_dir ./data/outputs --resume_from_checkpoint ./data/outputs/checkpoint-500
+python src/hal_det/training/train.py \
+--output_dir ./data/outputs \
+--resume_from_checkpoint ./data/outputs/checkpoint-500
 ```
 
-4.  (for serving):
-**Run the Service**
-    ```bash
-    uvicorn venra.main:app --reload --app-dir src
-    ```
-    The Sentinel Service is now active at `http://localhost:8000`.
+---
 
-## 🏗️ Architecture Vision
+## Dataset
 
-VeNRA is built on a modular, service-oriented architecture:
-1.  **Ingestion Engine:** Converts unstructured PDFs into a structured "Fact Ledger."
-2.  **Runtime Agent:** A program-aided agent that generates and executes Python code to answer queries.
-3.  **Sentinel Service:** An independent API that acts as the final gatekeeper for quality assurance.
+The hallucination detection dataset is available on Hugging Face:
 
-## 🤝 Contributing
+[https://huggingface.co/datasets/pagand/venra](https://huggingface.co/datasets/pagand/venra)
 
-This project is an active research prototype. We welcome contributions, especially in:
-*   Improving the extraction of complex tables.
-*   Enhancing the "Judge" model's ability to detect subtle hallucinations.
-*   Building a frontend dashboard for trace visualization.
+Unlike typical hallucination benchmarks, VeNRA-Data is created using **Adversarial Simulation**, programmatically sabotaging financial records to simulate real system failures such as:
 
-## 📄 License
+* Numeric Neighbor Traps
+* Logic-Code Mismatches
+* Temporal Column Drift
 
-Please reach out to us for enterprise and commercial licensing. Contact us at info@upaspro.com.
+---
 
-This project is licensed under the terms of the license included here [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+## Demo
 
-## 💬 How to Cite
-```
- @article{agandneuro,
+Try the hallucination detection model interactively:
+
+[https://huggingface.co/spaces/pagand/VeNRA_halDet](https://huggingface.co/spaces/pagand/VeNRA_halDet)
+
+---
+
+## Model
+
+LoRA adapter weights:
+
+[https://huggingface.co/pagand/venra](https://huggingface.co/pagand/venra)
+
+---
+
+## Contributing
+
+This project is conducted as part of research in [FactAI Lab](https://gofactai.com). Contributions are welcome in areas such as:
+
+* improving financial table extraction
+* expanding adversarial hallucination scenarios
+* enhancing trace auditing
+* building visualization dashboards for reasoning traces
+
+Please open an issue before submitting major changes.
+
+---
+
+## License
+
+This project is released under:
+
+**Creative Commons Attribution-NonCommercial-ShareAlike 4.0**
+
+[https://creativecommons.org/licenses/by-nc-sa/4.0/](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+
+For enterprise or commercial licensing inquiries:
+
+[pagand@gofactai.com](mailto:pagand@gofactai.com)
+
+---
+
+## Citation
+
+If you use VeNRA in your research, please cite:
+
+```bibtex
+@article{agand2026venra,
   title={Neuro-Symbolic Financial Reasoning via Deterministic Fact Ledgers and Adversarial Low-Latency Hallucination Detector},
   author={Agand, Pedram},
   journal={arXiv preprint arXiv:2603.04663},
