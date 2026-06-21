@@ -1,6 +1,6 @@
 #  VeNRA: Verifiable Numerical Reasoning Agent
 
-> **"Trust, but Verify." — The core philosophy of Financial AI**
+> **"Trust, but Verify." — The core philosophy of Financial AI** 
 
 <p align="center">
   <img src="assets/structure.webp" alt="VeNRA Architecture" width="55%">
